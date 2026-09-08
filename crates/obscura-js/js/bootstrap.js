@@ -10399,35 +10399,46 @@ function _xmlWellFormed(src) {
   return stack.length === 0 && rootsClosed === 1;
 }
 
+// The parsererror detail quotes tag names taken from the input, and it is
+// written through innerHTML, so `<` and `&` have to stop being markup.
+const _escapeXmlErrorText = (text) =>
+  String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
     const root = document.createElement("html");
 
-    // For XML mime types, check well-formedness first (conservative: only
-    // clear errors like tag mismatch / extra root are flagged).  If the
-    // check fires, build a <parsererror> root so callers doing
-    // doc.querySelector('parsererror') get the same signal as in Chrome.
+    // For XML mime types, surface a <parsererror> on clearly-malformed input so
+    // error-detection code (doc.querySelector('parsererror')) works, matching
+    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
+    //
+    // Two checks, one decision. `_xmlWellFormed` is the stricter of the pair --
+    // it also rejects input with no root element at all, and an unterminated
+    // comment/CDATA/PI -- so it decides whether this is an error. What it cannot
+    // do is say why: it returns a bool. `_checkXmlWellFormed` names the fault,
+    // so its message fills the <div> when it has one.
+    //
+    // These used to run as two independent blocks, the second overwriting the
+    // first. Since the stricter check flags everything the descriptive one
+    // flags, the description never reached a caller.
     const xmlError = isXml ? _checkXmlWellFormed(html) : null;
-    const isParserError = xmlError && !xmlError.wellFormed;
+    const isParserError = isXml && (!_xmlWellFormed(html) || !xmlError.wellFormed);
     if (isParserError) {
-      root.innerHTML = '<parsererror>' + xmlError.error + '</parsererror>';
+      const detail = (xmlError && xmlError.error) || 'error while parsing XML';
+      try {
+        root.innerHTML =
+          '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>' +
+          _escapeXmlErrorText(detail) +
+          '</div></parsererror>';
+      } catch (e) { /* ignore */ }
     } else {
       // innerHTML parses children via html5ever fragment-parsing rules. Most
       // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
       // fragment parser strips the outer `<html>` and emits its head+body
       // children, which is what callers want.
       try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
-    }
-
-    // For XML mime types, surface a <parsererror> on clearly-malformed input so
-    // error-detection code (doc.querySelector('parsererror')) works, matching
-    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
-    if (isXml && !_xmlWellFormed(html)) {
-      try {
-        root.innerHTML = '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>error while parsing XML</div></parsererror>';
-      } catch (e) { /* ignore */ }
     }
 
     // Helper: depth-first walk to find an element by predicate.
