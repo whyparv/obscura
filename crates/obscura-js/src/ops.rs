@@ -43,7 +43,14 @@ pub enum InterceptResolution {
     Fulfill {
         status: u16,
         headers: HashMap<String, String>,
+        /// Lossy UTF-8 view of the fulfilled body, for text consumers.
         body: String,
+        /// The exact fulfilled body as standard base64. CDP delivers the
+        /// fulfillRequest body base64-encoded; carrying it through unchanged
+        /// lets the bootstrap fetch layer reconstruct the exact bytes
+        /// (`_base64ToUint8Array`) instead of a `from_utf8_lossy` corruption
+        /// of any non-UTF-8 payload (image, font, protobuf). See #912.
+        body_base64: String,
     },
     Fail {
         reason: String,
@@ -2300,6 +2307,28 @@ fn cors_response_allows(
     }
 }
 
+/// Build the JS-facing result for an intercepted request a CDP client chose to
+/// fulfill (`Fetch.fulfillRequest`). Mirrors the normal fetch result contract:
+/// `body` is a lossy text view and `bodyBase64` carries the exact bytes, which
+/// the bootstrap fetch layer prefers (`_base64ToUint8Array`) so a binary
+/// fulfilled body is delivered intact rather than `from_utf8_lossy`-corrupted.
+/// See #912.
+fn intercept_fulfill_response(
+    status: u16,
+    headers: HashMap<String, String>,
+    body: &str,
+    body_base64: &str,
+    url: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "body": body,
+        "bodyBase64": body_base64,
+        "url": url,
+        "headers": headers,
+    })
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -2425,15 +2454,9 @@ async fn op_fetch_url(
                     status,
                     headers: h,
                     body: b,
+                    body_base64: bb,
                 }) => {
-                    let resp_headers: HashMap<String, String> = h;
-                    return Ok(serde_json::json!({
-                        "status": status,
-                        "body": b,
-                        "url": url,
-                        "headers": resp_headers,
-                    })
-                    .to_string());
+                    return Ok(intercept_fulfill_response(status, h, &b, &bb, &url).to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -3120,6 +3143,31 @@ mod tests {
 
     use super::read_body_capped;
     use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+    use super::intercept_fulfill_response;
+    use base64::{engine::general_purpose::STANDARD as FULFILL_BASE64, Engine as _};
+
+    // #912 — a fulfilled binary body (non-UTF-8) must survive as exact bytes via
+    // `bodyBase64`, not be silently corrupted by the lossy `body` text view.
+    #[test]
+    fn intercept_fulfill_carries_binary_body_as_base64() {
+        let raw = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00];
+        let b64 = FULFILL_BASE64.encode(raw);
+        let lossy = String::from_utf8_lossy(&raw).to_string();
+        let result = intercept_fulfill_response(
+            200,
+            std::collections::HashMap::new(),
+            &lossy,
+            &b64,
+            "https://example.test/",
+        );
+        let out_b64 = result["bodyBase64"]
+            .as_str()
+            .expect("fulfill result must carry bodyBase64");
+        let decoded = FULFILL_BASE64
+            .decode(out_b64)
+            .expect("bodyBase64 must be valid base64");
+        assert_eq!(decoded, raw, "the exact bytes must survive via bodyBase64");
+    }
 
     // SEC-002 / #705 — fetched_urls (and the like) must not grow without bound.
     #[test]
