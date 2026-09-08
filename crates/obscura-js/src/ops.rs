@@ -3168,6 +3168,45 @@ mod tests {
         assert_eq!(dk.len(), 32, "derived key must have the requested length");
     }
 
+    // HKDF and the CSPRNG draw share the same DoS shape: both size an output
+    // buffer straight from an untrusted u32 length. Each must reject a length
+    // above its fixed maximum before allocating, and still work for ordinary
+    // inputs. See #910.
+    use super::{hkdf_derive, random_bytes, HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX};
+
+    #[test]
+    fn hkdf_rejects_excessive_output_length() {
+        let err = hkdf_derive("SHA-256", b"ikm", b"salt", b"info", HKDF_MAX_OUTPUT_BYTES + 1)
+            .expect_err("output length above the cap must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "error should name the length cap: {err}"
+        );
+    }
+
+    #[test]
+    fn hkdf_derives_within_limits() {
+        let okm = hkdf_derive("SHA-256", b"ikm", b"salt", b"info", 32)
+            .expect("ordinary parameters must derive successfully");
+        assert_eq!(okm.len(), 32, "derived key must have the requested length");
+    }
+
+    #[test]
+    fn random_bytes_rejects_excessive_length() {
+        let err = random_bytes(RANDOM_BYTES_MAX + 1)
+            .expect_err("a draw above the cap must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "error should name the length cap: {err}"
+        );
+    }
+
+    #[test]
+    fn random_bytes_within_limits() {
+        let buf = random_bytes(32).expect("an ordinary draw must succeed");
+        assert_eq!(buf.len(), 32, "draw must return the requested length");
+    }
+
 
     // SEC-005 / #581 — op_fetch_url must not buffer an unbounded response body.
     // read_body_capped streams the body and refuses anything larger than the
@@ -4414,18 +4453,26 @@ fn op_subtle_pbkdf2(
     pbkdf2_derive(hash, password, salt, iterations, length)
 }
 
-/// HKDF key derivation. `length` is the output length in bytes. An empty salt
-/// behaves as RFC 5869 specifies (HMAC zero-pads it to the block size, which is
-/// what browsers do).
-#[op2]
-#[buffer]
-fn op_subtle_hkdf(
-    #[string] hash: &str,
-    #[buffer] ikm: &[u8],
-    #[buffer] salt: &[u8],
-    #[buffer] info: &[u8],
+/// Generous DoS backstop on HKDF output length. HKDF itself rejects output
+/// above 255*HashLen, but only after the buffer is allocated, so an enormous
+/// `length` forces a multi-GB `vec![0u8; length]` first. This bound sits far
+/// above any legitimate derived key and mirrors `PBKDF2_MAX_OUTPUT_BYTES`.
+const HKDF_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+
+/// HKDF derivation with a DoS guard. Split out from the op so the bound is
+/// unit-testable without the `#[op2]` wrapper.
+fn hkdf_derive(
+    hash: &str,
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if length > HKDF_MAX_OUTPUT_BYTES {
+        return Err(crypto_err(format!(
+            "HKDF output length {length} bytes exceeds the supported maximum of {HKDF_MAX_OUTPUT_BYTES}"
+        )));
+    }
     use hkdf::Hkdf;
     let mut okm = vec![0u8; length as usize];
     macro_rules! run {
@@ -4445,6 +4492,40 @@ fn op_subtle_hkdf(
     Ok(okm)
 }
 
+/// HKDF key derivation. `length` is the output length in bytes. An empty salt
+/// behaves as RFC 5869 specifies (HMAC zero-pads it to the block size, which is
+/// what browsers do).
+#[op2]
+#[buffer]
+fn op_subtle_hkdf(
+    #[string] hash: &str,
+    #[buffer] ikm: &[u8],
+    #[buffer] salt: &[u8],
+    #[buffer] info: &[u8],
+    length: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    hkdf_derive(hash, ikm, salt, info, length)
+}
+
+/// Generous DoS backstop on a single CSPRNG draw. `getRandomValues` already
+/// enforces the WebCrypto 65536-byte limit in JS; this guards the native op
+/// against other callers (notably HMAC `generateKey`, whose `length` is
+/// attacker-controllable) forcing a multi-GB allocation plus CSPRNG read.
+const RANDOM_BYTES_MAX: u32 = 1024 * 1024;
+
+/// Draw `len` bytes from the OS CSPRNG, with a DoS guard. Split out from the op
+/// so the bound is unit-testable without the `#[op2]` wrapper.
+fn random_bytes(len: u32) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if len > RANDOM_BYTES_MAX {
+        return Err(crypto_err(format!(
+            "random byte request of {len} bytes exceeds the supported maximum of {RANDOM_BYTES_MAX}"
+        )));
+    }
+    let mut buf = vec![0u8; len as usize];
+    getrandom::getrandom(&mut buf).map_err(|e| crypto_err(format!("getrandom failed: {e}")))?;
+    Ok(buf)
+}
+
 /// Fill `len` bytes from the OS CSPRNG. Backs `crypto.getRandomValues`,
 /// `crypto.randomUUID`, and `generateKey`, replacing the old Math.random shim
 /// (which was neither uniform across typed-array widths nor cryptographically
@@ -4452,9 +4533,7 @@ fn op_subtle_hkdf(
 #[op2]
 #[buffer]
 fn op_random_bytes(len: u32) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    let mut buf = vec![0u8; len as usize];
-    getrandom::getrandom(&mut buf).map_err(|e| crypto_err(format!("getrandom failed: {e}")))?;
-    Ok(buf)
+    random_bytes(len)
 }
 
 /// Serialize a parsed URL into the WHATWG IDL component shape consumed by the
