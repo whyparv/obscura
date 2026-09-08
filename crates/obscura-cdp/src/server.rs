@@ -1198,7 +1198,7 @@ fn is_navigate_method(text: &str) -> bool {
 // Fetch.continueRequest / fulfillRequest) into a map. Returns None when the
 // `headers` field is absent, so the caller can leave the request's headers
 // untouched rather than clearing them.
-fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, String>> {
+pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, String>> {
     let arr = params.get("headers")?.as_array()?;
     Some(
         arr.iter()
@@ -1576,7 +1576,7 @@ async fn process_cdp_message(
     }
 }
 
-fn decode_base64(input: &str) -> String {
+pub(crate) fn decode_base64(input: &str) -> String {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
