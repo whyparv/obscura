@@ -145,7 +145,13 @@ pub async fn handle(
                     crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
-                result.as_f64().map(|n| n as u64).unwrap_or(0)
+                // JS returns -1 for an unresolvable object; `-1.0 as u64` would
+                // saturate to 0 (the document root), so check before casting.
+                let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
+                if nid < 0 {
+                    return Err(format!("objectId {oid} could not be resolved to a node"));
+                }
+                nid as u64
             } else {
                 return Err("nodeId or objectId required".to_string());
             };
@@ -167,7 +173,13 @@ pub async fn handle(
                     crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
-                result.as_f64().map(|n| n as u64).unwrap_or(0)
+                // JS returns -1 for an unresolvable object; `-1.0 as u64` would
+                // saturate to 0 (the document root), so check before casting.
+                let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
+                if nid < 0 {
+                    return Err(format!("objectId {oid} could not be resolved to a node"));
+                }
+                nid as u64
             } else {
                 return Err("nodeId or objectId required".to_string());
             };
@@ -533,6 +545,67 @@ mod tests {
     // which is where its tests went with it: the three lookup sites here embed
     // the id as a JSON literal rather than splicing it into a single-quoted
     // string, so there is no per-domain escaping left to assert on.
+
+    // A stale/invalid objectId resolves to -1 in JS. describeNode/resolveNode
+    // must surface an error, not cast -1 to nodeId 0 (the document root) and
+    // return the wrong node. See #917.
+    #[tokio::test]
+    async fn describe_node_errors_on_unresolvable_object_id() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<p>hi</p>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let res = handle(
+            "describeNode",
+            &json!({ "objectId": "no-such-object" }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "describeNode must error on an unresolvable objectId, got: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_node_errors_on_unresolvable_object_id() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<p>hi</p>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let res = handle(
+            "resolveNode",
+            &json!({ "objectId": "no-such-object" }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "resolveNode must error on an unresolvable objectId, got: {res:?}"
+        );
+    }
 
     #[tokio::test]
     async fn dom_focus_sets_active_element() {
