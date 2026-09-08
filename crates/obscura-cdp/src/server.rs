@@ -1091,57 +1091,89 @@ fn emit_intercepted_request(
 }
 
 async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
-    let Some(page) = ctx.pages.iter_mut().find(|page| page.has_js()) else {
+    // Several pages on one connection can be live at once (#872), each with its
+    // own event loop, so pump a turn on *every* live page rather than only the
+    // first. The pump stays armed until all live pages report idle.
+    let live_ids: Vec<String> = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js())
+        .map(|page| page.id.clone())
+        .collect();
+    if live_ids.is_empty() {
         return Ok(true);
-    };
-    page.run_autonomous_event_loop_turn().await
+    }
+    let mut all_idle = true;
+    for page_id in live_ids {
+        if let Some(page) = ctx.get_page_mut(&page_id) {
+            all_idle &= page.run_autonomous_event_loop_turn().await?;
+        }
+    }
+    Ok(all_idle)
 }
 
 fn sync_live_page_network_events(ctx: &mut CdpContext) {
-    let page_route = ctx.pages.iter().find(|page| page.has_js()).and_then(|page| {
-        ctx.sessions
+    // Emit script-initiated network events for every live page, each attributed
+    // to its own session/frame — not just the first live page (#872).
+    let live_ids: Vec<String> = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js())
+        .map(|page| page.id.clone())
+        .collect();
+    for page_id in live_ids {
+        let Some(session_id) = ctx
+            .sessions
             .iter()
-            .find(|(_, page_id)| *page_id == &page.id)
-            .map(|(session_id, _)| {
-                (
-                    Some(session_id.clone()),
-                    page.id.clone(),
-                    page.frame_id.clone(),
-                    page.url_string(),
-                )
-            })
-    });
-    let Some((session_id, page_id, frame_id, page_url)) = page_route else {
-        return;
-    };
-    let network_events = {
-        let Some(page) = ctx.get_page_mut(&page_id) else {
-            return;
+            .find(|(_, pid)| *pid == &page_id)
+            .map(|(session_id, _)| Some(session_id.clone()))
+        else {
+            continue;
         };
-        page.sync_js_network_events();
-        page.network_events.drain(..).collect::<Vec<_>>()
-    };
-    crate::domains::page::emit_runtime_network_events(
-        ctx,
-        &session_id,
-        &frame_id,
-        &page_url,
-        &page_id,
-        &network_events,
-    );
+        let (frame_id, page_url, network_events) = {
+            let Some(page) = ctx.get_page_mut(&page_id) else {
+                continue;
+            };
+            page.sync_js_network_events();
+            (
+                page.frame_id.clone(),
+                page.url_string(),
+                page.network_events.drain(..).collect::<Vec<_>>(),
+            )
+        };
+        if network_events.is_empty() {
+            continue;
+        }
+        crate::domains::page::emit_runtime_network_events(
+            ctx,
+            &session_id,
+            &frame_id,
+            &page_url,
+            &page_id,
+            &network_events,
+        );
+    }
 }
 
 fn take_live_pending_navigation(
     ctx: &CdpContext,
 ) -> Option<(String, String, String, String)> {
-    let page = ctx.pages.iter().find(|page| page.has_js())?;
-    let session_id = ctx
-        .sessions
-        .iter()
-        .find(|(_, page_id)| *page_id == &page.id)
-        .map(|(session_id, _)| session_id.clone())?;
-    let (url, method, body) = page.take_pending_navigation()?;
-    Some((session_id, url, method, body))
+    // With several live pages, a pending navigation may belong to any of them,
+    // not just the first live page — scan until one yields a navigation (#872).
+    for page in ctx.pages.iter().filter(|page| page.has_js()) {
+        let Some(session_id) = ctx
+            .sessions
+            .iter()
+            .find(|(_, page_id)| *page_id == &page.id)
+            .map(|(session_id, _)| session_id.clone())
+        else {
+            continue;
+        };
+        if let Some((url, method, body)) = page.take_pending_navigation() {
+            return Some((session_id, url, method, body));
+        }
+    }
+    None
 }
 
 fn forward_pending_events(
@@ -1308,20 +1340,15 @@ async fn process_with_interception(
         }
     };
 
-    // Issue #19 follow-up: V8 only allows ONE entered Isolate per OS thread.
-    // The regular dispatch path enforces this via `get_session_page_mut`
-    // (which `suspend_js`'es every other page before letting the target
-    // page run JS). The interception path here bypasses that — it removes
-    // the target page and spawns a nav task — so we have to enforce the
-    // same invariant explicitly. Otherwise nav-2's `init_js` constructs
-    // Isolate-2 while page-1's Isolate-1 is still alive in ctx.pages, and
-    // the next V8 scope unwind aborts the process via `Context::Exit`'s
-    // `heap->isolate() == Isolate::TryGetCurrent()` check.
-    for other in ctx.pages.iter_mut() {
-        if other.has_js() {
-            other.suspend_js();
-        }
-    }
+    // V8 allows only ONE *entered* isolate per OS thread, but many *live*
+    // ones. Since #756 every op enters its isolate only transiently (never
+    // across an `.await`) and construction leaves the entry stack empty, so a
+    // nav task's `init_js` can build a new isolate while other pages' isolates
+    // are live without tripping `Context::Exit`'s
+    // `heap->isolate() == Isolate::TryGetCurrent()` check. The old defensive
+    // `suspend_js` of every other page here (which tore their heaps down and
+    // was never resumed once the dispatch-path resume was removed in #872) is
+    // therefore no longer needed and would strand concurrent pages.
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let wait_until = crate::domains::page::parse_wait_until(&req.params);
