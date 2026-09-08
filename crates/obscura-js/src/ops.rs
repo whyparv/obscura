@@ -1587,6 +1587,20 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
+        // Nodes directly assigned to an HTML <slot> (named slot assignment; the
+        // first same-name slot in the shadow tree wins). `null` when the node is
+        // not an HTML slot inside a shadow tree, so JS can tell "no slot" from
+        // "slot without assignments" and fall back to the slot's own children.
+        "assigned_nodes" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            match dom.assigned_nodes(NodeId::new(nid)) {
+                Some(ids) => {
+                    let ids: Vec<i32> = ids.iter().map(|id| id.index() as i32).collect();
+                    serde_json::to_string(&ids).unwrap_or("[]".into())
+                }
+                None => "null".into(),
+            }
+        }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let name = dom
