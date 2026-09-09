@@ -1998,8 +1998,7 @@ impl ObscuraJsRuntime {
                     format!("globalThis.__obscura_objects['{}']", oid),
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(read)?;
-            return Ok(Self::info_from_json(&json_val));
+            return self.v8_to_cdp_value(read);
         }
 
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
@@ -2132,8 +2131,7 @@ impl ObscuraJsRuntime {
                         format!("globalThis.__obscura_objects['{}']", oid),
                     )
                     .map_err(|e| format!("JS error: {}", e))?;
-                let json_val = self.v8_to_json(read)?;
-                return Ok(Self::info_from_json(&json_val));
+                return self.v8_to_cdp_value(read);
             }
 
             let meta_result = self
@@ -2168,8 +2166,7 @@ impl ObscuraJsRuntime {
             let result = self
                 .execute_runtime_script("<callFnByValue>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(result)?;
-            return Ok(Self::info_from_json(&json_val));
+            return self.v8_to_cdp_value(result);
         }
 
         let code = format!(
@@ -3526,6 +3523,31 @@ impl ObscuraJsRuntime {
 
         let s = local.to_rust_string_lossy(scope);
         Ok(serde_json::Value::String(s))
+    }
+
+    fn v8_to_cdp_value(
+        &mut self,
+        result: deno_core::v8::Global<deno_core::v8::Value>,
+    ) -> Result<RemoteObjectInfo, String> {
+        // JSON collapses undefined into null. Classify it before serialization.
+        let is_undefined = {
+            let mut entered = self.runtime();
+            let scope = &mut entered.handle_scope();
+            deno_core::v8::Local::new(scope, &result).is_undefined()
+        };
+        if is_undefined {
+            return Ok(RemoteObjectInfo {
+                thrown: false,
+                js_type: "undefined".into(),
+                subtype: None,
+                class_name: String::new(),
+                description: String::new(),
+                object_id: None,
+                value: None,
+            });
+        }
+        let value = self.v8_to_json(result)?;
+        Ok(Self::info_from_json(&value))
     }
 
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {
