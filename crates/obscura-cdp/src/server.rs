@@ -747,7 +747,7 @@ fn accept_dispatch(
         // The request head is already sitting in the kernel receive buffer;
         // switch back to blocking mode for the synchronous /json serve.
         let _ = stream.set_nonblocking(false);
-        return handle_http_json_blocking(stream, port, ep);
+        return handle_http_json_blocking(stream, port, ep, head);
     }
     // Fall through: GET request that isn't a /json endpoint → treat as
     // WebSocket upgrade (Chromium DevTools clients issue GET with
@@ -775,11 +775,13 @@ fn handle_http_json_blocking(
     mut stream: std::net::TcpStream,
     port: u16,
     endpoint: &str,
+    request_head: &str,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
     let mut buf = vec![0u8; 4096];
     let _ = stream.read(&mut buf)?;
+    let authority = websocket_authority(request_head, port);
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
@@ -788,7 +790,7 @@ fn handle_http_json_blocking(
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             "V8-Version": "14.5.0.0",
             "WebKit-Version": "537.36",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
+            "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", authority),
         }))?,
         "list" => serde_json::to_string_pretty(&json!([{
             "description": "",
@@ -797,7 +799,7 @@ fn handle_http_json_blocking(
             "title": "",
             "type": "page",
             "url": "about:blank",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/page-1", port),
+            "webSocketDebuggerUrl": format!("ws://{}/devtools/page/page-1", authority),
         }]))?,
         "protocol" => {
             serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
@@ -812,6 +814,27 @@ fn handle_http_json_blocking(
     stream.write_all(resp.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+fn websocket_authority(request_head: &str, port: u16) -> String {
+    request_head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| {
+            let Ok(url) = url::Url::parse(&format!("http://{value}/")) else {
+                return false;
+            };
+            url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("127.0.0.1:{port}"))
 }
 
 /// Per-connection CDP processor. Each connection runs its own processor (with
@@ -1763,12 +1786,25 @@ async fn handle_connection_ws(
 mod tests {
     use super::{
         handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+        websocket_authority,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn discovery_uses_the_client_facing_http_authority() {
+        let request = "GET /json/version HTTP/1.1\r\nhOsT: cdp.example.test:9222\r\n\r\n";
+        assert_eq!(
+            websocket_authority(request, 9223),
+            "cdp.example.test:9222"
+        );
+
+        let malformed = "GET /json/version HTTP/1.1\r\nHost: attacker.test/path\r\n\r\n";
+        assert_eq!(websocket_authority(malformed, 9223), "127.0.0.1:9223");
+    }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {
