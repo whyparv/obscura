@@ -1271,14 +1271,18 @@ fn handle_fetch_resolution(
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
                     let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                    // `body` is a lossy text view; `body_base64` carries the CDP
+                    // body (already base64) through unchanged so op_fetch_url can
+                    // hand JS the exact bytes for a binary fulfill (#912).
                     let body = decode_base64(raw_body);
+                    let body_base64 = raw_body.to_string();
                     let headers = req.params.get("responseHeaders")
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|h| {
                             Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
                         }).collect())
                         .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
+                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }
                 }
                 "Fetch.failRequest" => {
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
