@@ -3935,7 +3935,11 @@ fn op_navigate(
 ) {
     let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
-    gs.url = url.to_string();
+    // Only queue the navigation — do NOT change the realm URL here. The URL is
+    // updated on commit via `set_url` once the navigation is actually performed.
+    // Moving it early let synchronous JS run between two navigations read and
+    // write another origin's cookies through document.cookie, whose ops derive
+    // the cookie domain from this URL (SOP bypass, #940).
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 

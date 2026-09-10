@@ -15468,6 +15468,30 @@ mod tests {
         );
     }
 
+    // #940: op_navigate must not move the document's cookie context before the
+    // navigation actually commits. A queued navigation to another origin must
+    // not let document.cookie read that origin's cookies (SOP bypass).
+    #[test]
+    fn queued_navigation_does_not_expose_another_origins_cookies() {
+        let (mut rt, jar) = setup_runtime_with_cookies("<html><body></body></html>");
+        // A cookie belonging to a different origin than the current page
+        // (the harness page is http://example.com/test).
+        let victim = url::Url::parse("https://victim.example/").unwrap();
+        jar.set_cookie("secret=victimtoken; Path=/", &victim);
+
+        // Start navigating to the victim origin. This only *queues* the
+        // navigation; it must not retroactively move the cookie context.
+        rt.evaluate("location.href = 'https://victim.example/'").unwrap();
+
+        let result = rt.evaluate("document.cookie").unwrap();
+        let cookie_str = result.as_str().unwrap();
+        assert!(
+            !cookie_str.contains("victimtoken"),
+            "document.cookie must not expose another origin's cookies after a queued navigation, got: {}",
+            cookie_str
+        );
+    }
+
     #[test]
     fn test_document_cookie_delete_via_max_age() {
         let (mut rt, jar) = setup_runtime_with_cookies("<html><body></body></html>");
