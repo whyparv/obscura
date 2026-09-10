@@ -496,6 +496,24 @@ fn cap_malloc_arenas() {
     }
 }
 
+/// Return free glibc heap pages after the last CDP connection tears down.
+///
+/// A connection owns its pages, DOMs, render buffers, and V8 isolates. Dropping
+/// those objects releases the allocations, but glibc normally keeps the freed
+/// pages mapped for reuse, so a server that becomes idle can retain its peak RSS
+/// indefinitely (#873). Trimming only when this is the final live connection
+/// avoids imposing a process-wide allocator pause on active clients.
+fn release_idle_connection_memory() {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: malloc_trim is process-wide and thread-safe. The caller has
+        // already dropped this connection's LocalSet and Tokio runtime.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+}
+
 /// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
 /// runtime + `LocalSet` hosting this connection's `cdp_processor` (with its own
 /// `CdpContext` and pages) and its frame reader. Confining a connection's pages
@@ -514,10 +532,17 @@ fn run_connection(
     // however it exits — clean close, error return, or panic. A plain
     // decrement at the end of the closure would leak slots on the early
     // returns below until the cap wedged the server shut.
-    struct SlotGuard(Arc<AtomicUsize>);
+    struct SlotGuard(Option<Arc<AtomicUsize>>);
+    impl SlotGuard {
+        fn release(&mut self) -> Option<usize> {
+            self.0
+                .take()
+                .map(|counter| counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1))
+        }
+    }
     impl Drop for SlotGuard {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::AcqRel);
+            self.release();
         }
     }
 
@@ -525,7 +550,7 @@ fn run_connection(
     let spawned = std::thread::Builder::new()
         .name("obscura-cdp-conn".into())
         .spawn(move || {
-            let _slot = SlotGuard(slot);
+            let mut slot_guard = SlotGuard(Some(slot));
             let default_context = Arc::new(
                 context_template.isolated_copy("default".to_string(), true),
             );
@@ -565,6 +590,12 @@ fn run_connection(
                 let _ = processor.await;
             });
 
+            // `LocalSet` owns any detached local navigation tasks, and the
+            // runtime owns their scheduler allocations. Drop both before the
+            // idle trim so every page allocation is eligible to be returned.
+            drop(local);
+            drop(rt);
+
             // Apply only this connection's cookie changes to the persistence
             // template. Unchanged cookies cannot overwrite another connection's
             // updates, while explicit deletes and replacements still persist.
@@ -576,6 +607,11 @@ fn run_connection(
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
                 persistence_context.save_cookies();
+            }
+
+            drop(persisted_context);
+            if slot_guard.release() == Some(0) {
+                release_idle_connection_memory();
             }
         });
 
