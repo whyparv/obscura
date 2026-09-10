@@ -6453,6 +6453,12 @@ function _elementClassFor(nid) {
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+  // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
+  // (createElementNS + cloneNode lands here) stays a plain Element.
+  if (tag === "SLOT" && globalThis.HTMLSlotElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLSlotElement;
+  }
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -6473,6 +6479,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+    if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -11655,7 +11662,54 @@ globalThis.HTMLLIElement = Element;
 globalThis.HTMLPreElement = Element;
 globalThis.HTMLHeadingElement = Element;
 globalThis.HTMLTemplateElement = Element;
-globalThis.HTMLSlotElement = Element;
+// <slot> needs its own brand: with `HTMLSlotElement = Element` every element
+// was an instance, but assignedElements() did not exist, so the common
+// `el instanceof HTMLSlotElement && el.assignedElements()` guard (Swiper's
+// getChildren helper, seen on idealo's search result slider) threw a
+// TypeError on a plain <div>.
+//
+// Direct assignment comes from the native DomTree::assigned_nodes (the same
+// named-slot algorithm the renderer uses: only HTML slots inside a shadow
+// tree, first same-name slot in tree order wins, elements match on their
+// `slot` attribute, text nodes go to the default slot). `flatten` walks
+// nested slots with a work list and falls back to a slot's own slottable
+// children. Limits: manual slot assignment (`slotAssignment: "manual"`,
+// `slot.assign()`) assigns nothing (fallback only); no `slotchange` events.
+function _slotDirectAssigned(slot) {
+  const ids = _domParse("assigned_nodes", slot._nid);
+  if (ids === null || ids === undefined) return null; // not an HTML slot in a shadow tree
+  const root = slot.getRootNode();
+  if (root instanceof ShadowRoot && root.slotAssignment === 'manual') return [];
+  return ids.map(_wrap).filter(Boolean);
+}
+function _slotFallbackChildren(slot) {
+  const out = [];
+  for (let child = slot.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === 1 || child.nodeType === 3) out.push(child);
+  }
+  return out;
+}
+function _slotAssignedNodes(slot, flatten) {
+  const assigned = _slotDirectAssigned(slot);
+  if (assigned === null) return [];
+  if (!flatten) return assigned;
+  const out = [];
+  const work = (assigned.length ? assigned : _slotFallbackChildren(slot)).reverse();
+  while (work.length) {
+    const node = work.pop();
+    const nested = node.nodeType === 1 ? _slotDirectAssigned(node) : null;
+    if (nested === null) { out.push(node); continue; }
+    const inner = nested.length ? nested : _slotFallbackChildren(node);
+    for (let i = inner.length - 1; i >= 0; i--) work.push(inner[i]);
+  }
+  return out;
+}
+globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
+  get name() { return this.getAttribute('name') || ''; }
+  set name(v) { this.setAttribute('name', String(v)); }
+  assignedNodes(options) { return _slotAssignedNodes(this, !!(options && options.flatten)); }
+  assignedElements(options) { return this.assignedNodes(options).filter(n => n.nodeType === 1); }
+};
 globalThis.HTMLOptionElement = Element;
 globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;

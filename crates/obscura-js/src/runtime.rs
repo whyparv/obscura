@@ -5322,6 +5322,140 @@ mod tests {
     }
 
     #[test]
+    fn slot_element_has_own_brand_and_named_assignment() {
+        // Regression for the idealo search result slider: Swiper's getChildren
+        // helper guards with `instanceof HTMLSlotElement` before calling
+        // assignedElements(). With `HTMLSlotElement = Element` the guard matched
+        // a plain <div> and the missing method threw a TypeError.
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="plain"><i></i></div><slot id="light"><i></i></slot></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r##"
+                const tags = nodes => nodes.map(n => n.nodeType === 3 ? "#text" : n.tagName).join(",");
+                const children = el => {
+                    const out = [...el.children];
+                    if (window.HTMLSlotElement && el instanceof HTMLSlotElement) {
+                        out.push(...el.assignedElements());
+                    }
+                    return out;
+                };
+                const plain = document.getElementById("plain");
+                const light = document.getElementById("light");
+                const created = document.createElement("slot");
+
+                const host = document.createElement("x-host");
+                document.body.appendChild(host);
+                host.innerHTML = '<b slot="title">T</b>text<span>S</span><em slot="missing">M</em>';
+                const root = host.attachShadow({ mode: "open" });
+                root.innerHTML = '<slot name="title"></slot><div><slot></slot></div>'
+                    + '<slot name="title"></slot><slot name="empty"><u>fallback</u></slot>';
+                const title = root.childNodes[0];
+                const dflt = root.childNodes[1].firstChild;
+                const dupe = root.childNodes[2];
+                const empty = root.childNodes[3];
+
+                const outer = document.createElement("x-outer");
+                document.body.appendChild(outer);
+                outer.innerHTML = "<p>deep</p>";
+                const outerRoot = outer.attachShadow({ mode: "open" });
+                outerRoot.innerHTML = "<x-inner><slot></slot></x-inner>";
+                const inner = outerRoot.firstChild;
+                const innerRoot = inner.attachShadow({ mode: "open" });
+                innerRoot.innerHTML = '<slot name="unused"></slot><slot></slot>';
+                const innerDefault = innerRoot.childNodes[1];
+
+                created.name = "n1";
+
+                // Later same-name slot: no direct assignment, but its own
+                // fallback children with flatten (comments are not slottable).
+                const dupHost = document.createElement("x-dup");
+                document.body.appendChild(dupHost);
+                dupHost.innerHTML = '<b slot="title">T</b>';
+                const dupRoot = dupHost.attachShadow({ mode: "open" });
+                dupRoot.innerHTML = '<slot name="title"></slot><slot name="title"><i>fb</i>text<!--c--></slot>';
+                const dupSlot = dupRoot.childNodes[1];
+
+                // Manual slot assignment is not implemented: nothing assigned, fallback only.
+                const manHost = document.createElement("x-man");
+                document.body.appendChild(manHost);
+                manHost.innerHTML = "<b>light</b>";
+                const manRoot = manHost.attachShadow({ mode: "open", slotAssignment: "manual" });
+                manRoot.innerHTML = "<slot><u>fb</u></slot>";
+                const manSlot = manRoot.firstChild;
+
+                // Foreign-namespace "SLOT" (also via cloneNode) is no HTML slot
+                // and must not steal the assignment of a following real slot.
+                const foreign = document.createElementNS("urn:example", "SLOT");
+                const foreignClone = foreign.cloneNode();
+                const fHost = document.createElement("x-foreign");
+                document.body.appendChild(fHost);
+                fHost.innerHTML = "<b>light</b>";
+                const fRoot = fHost.attachShadow({ mode: "open" });
+                fRoot.appendChild(foreignClone);
+                const realSlot = document.createElement("slot");
+                fRoot.appendChild(realSlot);
+
+                // Deep shadow tree: assignment must not depend on JS recursion depth.
+                const deepHost = document.createElement("x-deep");
+                document.body.appendChild(deepHost);
+                deepHost.innerHTML = "<b>deep-light</b>";
+                const deepRoot = deepHost.attachShadow({ mode: "open" });
+                let cursor = deepRoot;
+                for (let i = 0; i < 20000; i++) {
+                    const div = document.createElement("div");
+                    cursor.appendChild(div);
+                    cursor = div;
+                }
+                const deepSlot = document.createElement("slot");
+                cursor.appendChild(deepSlot);
+
+                return [
+                    plain instanceof HTMLSlotElement,
+                    light instanceof HTMLSlotElement,
+                    created instanceof HTMLSlotElement,
+                    light instanceof HTMLElement && light instanceof Element,
+                    typeof plain.assignedElements,
+                    light.assignedNodes().length + light.assignedElements().length
+                        + light.assignedNodes({ flatten: true }).length,
+                    children(plain).length,
+                    children(light).length,
+                    created.name + "|" + created.getAttribute("name") + "|" + title.name + "|" + dflt.name,
+                    tags(title.assignedElements()),
+                    tags(dflt.assignedNodes()),
+                    tags(dflt.assignedElements()),
+                    dupe.assignedNodes().length,
+                    empty.assignedNodes().length,
+                    tags(empty.assignedNodes({ flatten: true })),
+                    tags(innerDefault.assignedNodes()),
+                    tags(innerDefault.assignedNodes({ flatten: true })),
+                    tags(children(dflt)),
+                    dupSlot.assignedNodes().length,
+                    tags(dupSlot.assignedNodes({ flatten: true })),
+                    tags(dupSlot.assignedElements({ flatten: true })),
+                    manSlot.assignedNodes().length,
+                    tags(manSlot.assignedNodes({ flatten: true })),
+                    foreign instanceof HTMLSlotElement,
+                    foreignClone instanceof HTMLSlotElement,
+                    typeof foreignClone.assignedNodes,
+                    tags(realSlot.assignedNodes()),
+                    tags(deepSlot.assignedNodes()),
+                ];
+                "##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                false, true, true, true, "undefined", 0, 1, 1,
+                "n1|n1|title|", "B", "#text,SPAN", "SPAN", 0, 0, "U", "SLOT", "P", "SPAN",
+                0, "I,#text", "I", 0, "U", false, false, "undefined", "B", "B"
+            ])
+        );
+    }
+
+    #[test]
     fn shadow_root_children_expose_parent_siblings_and_composed_root() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
