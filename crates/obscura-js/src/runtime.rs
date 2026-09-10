@@ -5277,6 +5277,42 @@ mod tests {
     }
 
     #[test]
+    fn a_parsererror_says_what_was_wrong() {
+        // The <div> is where Chrome puts the reason, and callers show it. A
+        // parsererror that only says "error while parsing XML" tells a user
+        // nothing the presence of the element did not already say.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let detail = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<a><b></a>','application/xml'); return d.querySelector('parsererror').textContent;})()")
+            .unwrap();
+        let detail = detail.as_str().unwrap_or_default().to_string();
+        assert!(
+            detail.contains("mismatch") && detail.contains('b') && detail.contains('a'),
+            "the reason must name the fault and the tags involved, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_parsererror_detail_is_text_not_markup() {
+        // The reason quotes a tag name lifted from the input and is written
+        // through innerHTML, so an input tag name must not become an element.
+        //
+        // The input has to be one whose message carries the angle brackets:
+        // "unclosed tag <img>" does, "mismatch: img and a" does not, and a test
+        // built on the latter passes with the escaping removed.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let n = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<img src=x>','application/xml'); var e=d.querySelector('parsererror'); return e ? e.querySelectorAll('img').length : -1;})()")
+            .unwrap();
+        // JS numbers arrive as f64, so compare as one.
+        assert_eq!(
+            n.as_f64(),
+            Some(0.0),
+            "a tag name from the input became an element in the error detail"
+        );
+    }
+
+    #[test]
     fn dom_parser_html_never_gets_parsererror() {
         // HTML parsing is tolerant and must never synthesize a parsererror.
         let mut rt = setup_runtime("<html><body></body></html>");
