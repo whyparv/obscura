@@ -146,6 +146,12 @@ pub struct RenderResourceCache {
     #[cfg(test)]
     content_image_layout_retries: usize,
     sync_loading_enabled: bool,
+    /// Resources a cache-only lookup missed since the last `take_sync_misses`,
+    /// with the request identity layout used (image CORS profile or none) and
+    /// whether the consumer is a font.
+    /// Deduplicated so repeated layouts do not grow the list.
+    sync_misses: Vec<(String, Option<ImageRequestProfile>, bool)>,
+    sync_miss_keys: HashSet<String>,
     loader: Box<dyn RenderResourceLoader>,
 }
 
@@ -185,6 +191,8 @@ impl RenderResourceCache {
             #[cfg(test)]
             content_image_layout_retries: 0,
             sync_loading_enabled: true,
+            sync_misses: Vec::new(),
+            sync_miss_keys: HashSet::new(),
             loader: Box::new(loader),
         }
     }
@@ -195,6 +203,47 @@ impl RenderResourceCache {
     /// unknown and can still be fetched by a later navigation/settle warmup.
     pub fn set_sync_loading_enabled(&mut self, enabled: bool) -> bool {
         std::mem::replace(&mut self.sync_loading_enabled, enabled)
+    }
+
+    /// Whether layout and paint may still open synchronous compatibility
+    /// requests. Page-owned caches disable this permanently and are fed by
+    /// the page transport instead.
+    pub fn sync_loading_enabled(&self) -> bool {
+        self.sync_loading_enabled
+    }
+
+    /// Take the resources that cache-only layout or paint asked for and did
+    /// not have, exactly as they were resolved (network URL plus the image
+    /// request profile, or `None` for CSS images and fonts). The owning page
+    /// loads them through its asynchronous transport; nothing is
+    /// reconstructed from the DOM, so script-registered fonts, shadow roots
+    /// and every other renderer-only source are covered.
+    pub fn take_sync_misses(&mut self) -> Vec<(String, Option<ImageRequestProfile>, bool)> {
+        self.sync_miss_keys.clear();
+        std::mem::take(&mut self.sync_misses)
+    }
+
+    /// Whether any cache-only miss is waiting to be taken.
+    pub fn has_sync_misses(&self) -> bool {
+        !self.sync_misses.is_empty()
+    }
+
+    fn record_sync_miss(
+        &mut self,
+        key: String,
+        url: String,
+        profile: Option<ImageRequestProfile>,
+        is_font: bool,
+    ) {
+        // Bound a hostile document's per-layout queue to the number of
+        // entries this cache could retain. A later layout reports skipped
+        // misses again after the current batch has been drained.
+        if self.sync_misses.len() >= self.max_entries {
+            return;
+        }
+        if self.sync_miss_keys.insert(key) {
+            self.sync_misses.push((url, profile, is_font));
+        }
     }
 
     pub fn retained_entry_count(&self) -> usize {
@@ -228,7 +277,16 @@ impl RenderResourceCache {
     }
 
     pub fn seed_image(&mut self, url: String, profile: ImageRequestProfile, bytes: Vec<u8>) {
-        self.seed(image_resource_key(&url, profile), bytes);
+        self.seed_shared(image_resource_key(&url, profile), Arc::from(bytes));
+    }
+
+    pub fn seed_image_shared(
+        &mut self,
+        url: String,
+        profile: ImageRequestProfile,
+        bytes: Arc<[u8]>,
+    ) {
+        self.seed_shared(image_resource_key(&url, profile), bytes);
     }
 
     pub fn seed_image_missing(&mut self, url: String, profile: ImageRequestProfile) {
@@ -242,9 +300,14 @@ impl RenderResourceCache {
     /// layer uses this entry point to fetch a bounded resource batch through
     /// its cookie/proxy/CORS-aware connection pool before entering layout.
     pub fn seed(&mut self, url: String, bytes: Vec<u8>) {
+        self.seed_shared(url, Arc::from(bytes));
+    }
+
+    /// Seed already-shared bytes without copying a complete response body.
+    pub fn seed_shared(&mut self, url: String, bytes: Arc<[u8]>) {
         let url = network_resource_url(&url);
         self.remove(&url);
-        self.insert_bytes(url, Arc::from(bytes));
+        self.insert_bytes(url, bytes);
     }
 
     /// Retain a page-transport failure so capture does not immediately repeat
@@ -406,7 +469,7 @@ impl RenderResourceCache {
         }
     }
 
-    fn get_or_load(&mut self, url: &str) -> Option<Arc<[u8]>> {
+    fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<Arc<[u8]>> {
         let url = network_resource_url(url);
         if let Some(entry) = self.entries.get(&url) {
             match entry {
@@ -418,6 +481,7 @@ impl RenderResourceCache {
             }
         }
         if !self.sync_loading_enabled {
+            self.record_sync_miss(url.clone(), url, None, is_font);
             return None;
         }
         self.remove(&url);
@@ -451,6 +515,7 @@ impl RenderResourceCache {
             }
         }
         if !self.sync_loading_enabled {
+            self.record_sync_miss(key, network_resource_url(url), Some(profile), false);
             return None;
         }
         self.remove(&key);
@@ -6933,6 +6998,23 @@ fn fetch_bytes(
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
 ) -> Option<Arc<[u8]>> {
+    fetch_bytes_with_kind(src, base_url, cache, false)
+}
+
+fn fetch_font_bytes(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+) -> Option<Arc<[u8]>> {
+    fetch_bytes_with_kind(src, base_url, cache, true)
+}
+
+fn fetch_bytes_with_kind(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+    is_font: bool,
+) -> Option<Arc<[u8]>> {
     if let Some(rest) = src.strip_prefix("data:") {
         let comma_idx = rest.find(',')?;
         let (meta, data) = (&rest[..comma_idx], &rest[comma_idx + 1..]);
@@ -6948,7 +7030,7 @@ fn fetch_bytes(
         return Some(Arc::from(bytes));
     }
     let resolved = resolve_resource_url(src, base_url)?;
-    cache.get_or_load(&resolved)
+    cache.get_or_load(&resolved, is_font)
 }
 
 fn fetch_profiled_image_bytes(
@@ -7169,7 +7251,7 @@ fn fetch_and_decode_font(
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
 ) -> Option<Vec<u8>> {
-    let compressed = fetch_bytes(src, base_url, cache)?;
+    let compressed = fetch_font_bytes(src, base_url, cache)?;
     if compressed.len() > 8 * 1024 * 1024 {
         return None;
     }
@@ -11706,7 +11788,7 @@ mod tests {
 
         let previous = cache.set_sync_loading_enabled(false);
         assert!(previous);
-        assert!(cache.get_or_load(url).is_none());
+        assert!(cache.get_or_load(url, false).is_none());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(
             !cache.has_live_outcome(url),
@@ -11715,8 +11797,77 @@ mod tests {
 
         cache.set_sync_loading_enabled(previous);
         cache.seed(url.to_string(), vec![9, 8, 7]);
-        assert_eq!(cache.get_or_load(url).as_deref(), Some([9, 8, 7].as_slice()));
+        assert_eq!(cache.get_or_load(url, false).as_deref(), Some([9, 8, 7].as_slice()));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cache_only_misses_are_reported_with_their_request_identity() {
+        let mut cache = RenderResourceCache::with_loader(|_url: &str| Some(vec![1, 2, 3]));
+        let font = "https://example.test/font?id=late";
+        let image = "https://example.test/late.png#fragment";
+        assert!(!cache.has_sync_misses());
+
+        cache.set_sync_loading_enabled(false);
+        assert!(cache.get_or_load(font, true).is_none());
+        assert!(cache.get_or_load(font, true).is_none(), "a repeated miss is reported once");
+        assert!(cache
+            .get_or_load_image(image, ImageRequestProfile::CorsInclude)
+            .is_none());
+        assert!(cache.has_sync_misses());
+        assert_eq!(
+            cache.take_sync_misses(),
+            vec![
+                (font.to_string(), None, true),
+                (
+                    "https://example.test/late.png".to_string(),
+                    Some(ImageRequestProfile::CorsInclude),
+                    false,
+                ),
+            ],
+            "misses carry the network URL, image request profile and resource kind"
+        );
+        assert!(!cache.has_sync_misses(), "take clears the report");
+
+        cache.seed(font.to_string(), vec![9]);
+        assert!(cache.get_or_load(font, true).is_some());
+        assert!(!cache.has_sync_misses(), "a hit is not a miss");
+
+        cache.set_sync_loading_enabled(true);
+        assert!(cache
+            .get_or_load("https://example.test/other.png", false)
+            .is_some());
+        assert!(
+            !cache.has_sync_misses(),
+            "the synchronous compatibility loader never reports a miss"
+        );
+    }
+
+    #[test]
+    fn cache_only_miss_queue_respects_the_cache_entry_limit() {
+        let mut cache = RenderResourceCache::with_loader_and_limits(
+            |_url: &str| None,
+            1,
+            DEFAULT_RESOURCE_CACHE_BYTES,
+        );
+        cache.set_sync_loading_enabled(false);
+
+        assert!(cache
+            .get_or_load("https://example.test/first.png", false)
+            .is_none());
+        assert!(cache
+            .get_or_load("https://example.test/second.png", false)
+            .is_none());
+        assert_eq!(cache.take_sync_misses().len(), 1);
+
+        assert!(cache
+            .get_or_load("https://example.test/second.png", false)
+            .is_none());
+        assert_eq!(
+            cache.take_sync_misses().len(),
+            1,
+            "a deferred miss is reported later"
+        );
     }
 
     #[test]
