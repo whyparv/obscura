@@ -16266,6 +16266,85 @@ mod tests {
         );
     }
 
+    fn cors_preflight_runtime() -> (
+        ObscuraJsRuntime,
+        String,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let target = format!("http://{address}/resource");
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]).to_string();
+                requests_tx.send(request.clone()).unwrap();
+                let response = if request.starts_with("OPTIONS ") {
+                    "HTTP/1.1 204 No Content\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Access-Control-Allow-Headers: content-type\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    "HTTP/1.1 200 OK\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .to_string()
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let rt = setup_runtime("<html><body></body></html>");
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        (rt, target, requests_rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn denied_preflight_never_sends_the_unsafe_request() {
+        let (mut rt, target, requests) = cors_preflight_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => await fetch({target:?}, {{
+                        method: "DELETE",
+                        headers: {{ "Authorization": "Bearer test" }},
+                    }}).then(() => "resolved", () => "rejected")"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("rejected")));
+
+        let preflight = requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("preflight request");
+        assert!(preflight.starts_with("OPTIONS /resource "), "{preflight}");
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the denied DELETE request reached the server"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_preserves_binary_body_sources_at_the_op_boundary() {
         let mut rt = setup_runtime("<html><body></body></html>");

@@ -2321,6 +2321,162 @@ fn cors_response_allows(
     }
 }
 
+fn is_cors_safelisted_method(method: &reqwest::Method) -> bool {
+    matches!(method.as_str(), "GET" | "HEAD" | "POST")
+}
+
+fn is_cors_unsafe_request_header_byte(byte: u8) -> bool {
+    (byte < 0x20 && byte != b'\t')
+        || matches!(
+            byte,
+            b'"' | b'(' | b')' | b':' | b'<' | b'>' | b'?' | b'@' | b'[' | b'\\'
+                | b']' | b'{' | b'}' | 0x7f
+        )
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
+fn is_cors_safelisted_content_type(value: &str) -> bool {
+    if value.bytes().any(is_cors_unsafe_request_header_byte) {
+        return false;
+    }
+
+    // A MIME type must have a valid type/subtype before its parameters. This
+    // is deliberately narrower than merely splitting at ';': malformed values
+    // must not turn an application/json request into a simple request.
+    let essence = value
+        .split_once(';')
+        .map_or(value, |(essence, _)| essence)
+        .trim_matches([' ', '\t']);
+    let Some((type_, subtype)) = essence.split_once('/') else {
+        return false;
+    };
+    if type_.is_empty()
+        || subtype.is_empty()
+        || !type_.bytes().all(is_http_token_byte)
+        || !subtype.bytes().all(is_http_token_byte)
+    {
+        return false;
+    }
+
+    essence.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        || essence.eq_ignore_ascii_case("multipart/form-data")
+        || essence.eq_ignore_ascii_case("text/plain")
+}
+
+fn decimal_is_at_most(left: &str, right: &str) -> bool {
+    let left = left.trim_start_matches('0');
+    let right = right.trim_start_matches('0');
+    left.len() < right.len() || (left.len() == right.len() && left <= right)
+}
+
+fn is_cors_safelisted_range(value: &str) -> bool {
+    let Some(range) = value.strip_prefix("bytes=") else {
+        return false;
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return false;
+    };
+    if start.is_empty()
+        || !start.bytes().all(|byte| byte.is_ascii_digit())
+        || !end.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    end.is_empty() || decimal_is_at_most(start, end)
+}
+
+fn is_cors_safelisted_request_header(name: &str, value: &str) -> bool {
+    if value.len() > 128 {
+        return false;
+    }
+    if name.eq_ignore_ascii_case("accept") {
+        return !value.bytes().any(is_cors_unsafe_request_header_byte);
+    }
+    if name.eq_ignore_ascii_case("accept-language")
+        || name.eq_ignore_ascii_case("content-language")
+    {
+        return value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'*' | b',' | b'-' | b'.' | b';' | b'=')
+        });
+    }
+    if name.eq_ignore_ascii_case("content-type") {
+        return is_cors_safelisted_content_type(value);
+    }
+    if name.eq_ignore_ascii_case("range") {
+        return is_cors_safelisted_range(value);
+    }
+    false
+}
+
+/// Return the sorted, lowercase header names that must be authorized by a
+/// CORS preflight. The aggregate safelist cap is observable only on unusual
+/// requests and does not add work to same-origin requests.
+fn cors_unsafe_request_header_names(headers: &HashMap<String, String>) -> Vec<String> {
+    let mut unsafe_names = Vec::new();
+    let mut safelist_value_size = 0usize;
+
+    for (name, value) in headers {
+        if is_cors_safelisted_request_header(name, value) {
+            safelist_value_size = safelist_value_size.saturating_add(value.len());
+        } else {
+            unsafe_names.push(name.to_ascii_lowercase());
+        }
+    }
+    if safelist_value_size > 1024 {
+        unsafe_names.extend(
+            headers
+                .iter()
+                .filter(|(name, value)| is_cors_safelisted_request_header(name, value))
+                .map(|(name, _)| name.to_ascii_lowercase()),
+        );
+    }
+    unsafe_names.sort_unstable();
+    unsafe_names.dedup();
+    unsafe_names
+}
+
+fn parse_cors_header_list<'a>(
+    headers: &'a reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Option<Vec<&'a str>> {
+    let mut items = Vec::new();
+    for value in headers.get_all(name).iter() {
+        let value = value.to_str().ok()?;
+        for item in value.split(',') {
+            let item = item.trim_matches([' ', '\t']);
+            if item.is_empty() || !item.bytes().all(is_http_token_byte) {
+                return None;
+            }
+            items.push(item);
+        }
+    }
+    Some(items)
+}
+
+fn preflight_allows_method(method: &reqwest::Method, allowed: &[&str], credentialed: bool) -> bool {
+    is_cors_safelisted_method(method)
+        || allowed.iter().any(|allowed| {
+            *allowed == method.as_str() || (*allowed == "*" && !credentialed)
+        })
+}
+
+fn preflight_allows_header(name: &str, allowed: &[&str], credentialed: bool) -> bool {
+    allowed
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+        || (!name.eq_ignore_ascii_case("authorization")
+            && !credentialed
+            && allowed.contains(&"*"))
+}
+
 /// Build the JS-facing result for an intercepted request a CDP client chose to
 /// fulfill (`Fetch.fulfillRequest`). Mirrors the normal fetch result contract:
 /// `body` is a lossy text view and `bodyBase64` carries the exact bytes, which
@@ -2570,33 +2726,28 @@ async fn op_fetch_url(
         }
     }
 
+    let unsafe_header_names = if is_cross_origin && mode == "cors" {
+        cors_unsafe_request_header_names(&custom_headers)
+    } else {
+        Vec::new()
+    };
     let needs_preflight = is_cross_origin
         && mode == "cors"
-        && (req_method != reqwest::Method::GET
-            && req_method != reqwest::Method::HEAD
-            && req_method != reqwest::Method::POST
-            || custom_headers.keys().any(|k| {
-                let kl = k.to_lowercase();
-                kl != "accept"
-                    && kl != "accept-language"
-                    && kl != "content-language"
-                    && kl != "content-type"
-            }));
+        && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
-        let preflight = client
+        let mut preflight_request = client
             .request(reqwest::Method::OPTIONS, &url)
             .timeout(fetch_timeout())
             .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str())
-            .header(
+            .header("Access-Control-Request-Method", method.as_str());
+        if !unsafe_header_names.is_empty() {
+            preflight_request = preflight_request.header(
                 "Access-Control-Request-Headers",
-                custom_headers
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
+                unsafe_header_names.join(","),
+            );
+        }
+        let preflight = preflight_request
             .send()
             .await
             .map_err(|e| {
@@ -2618,6 +2769,47 @@ async fn op_fetch_url(
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
+            )));
+        }
+        if !preflight.status().is_success() {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight returned HTTP {}",
+                preflight.status()
+            )));
+        }
+
+        let allowed_methods = parse_cors_header_list(
+            preflight.headers(),
+            "access-control-allow-methods",
+        )
+        .ok_or_else(|| {
+            deno_error::JsErrorBox::generic(
+                "CORS preflight returned an invalid Access-Control-Allow-Methods value",
+            )
+        })?;
+        let allowed_headers = parse_cors_header_list(
+            preflight.headers(),
+            "access-control-allow-headers",
+        )
+        .ok_or_else(|| {
+            deno_error::JsErrorBox::generic(
+                "CORS preflight returned an invalid Access-Control-Allow-Headers value",
+            )
+        })?;
+        let credentialed = credentials == FetchCredentials::Include;
+        if !preflight_allows_method(&req_method, &allowed_methods, credentialed) {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight did not allow method '{}'",
+                req_method
+            )));
+        }
+        if let Some(name) = unsafe_header_names
+            .iter()
+            .find(|name| !preflight_allows_header(name, &allowed_headers, credentialed))
+        {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight did not allow request header '{}'",
+                name
             )));
         }
     }
@@ -3139,11 +3331,15 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cors_response_allows, glob_match, validate_fetch_url, FetchCredentials, ObscuraState,
+        cors_response_allows, cors_unsafe_request_header_names, glob_match,
+        is_cors_safelisted_content_type, is_cors_safelisted_request_header,
+        parse_cors_header_list, preflight_allows_header, preflight_allows_method,
+        validate_fetch_url, FetchCredentials, ObscuraState,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     #[cfg(feature = "render")]
@@ -3159,6 +3355,139 @@ mod tests {
     use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
     use super::intercept_fulfill_response;
     use base64::{engine::general_purpose::STANDARD as FULFILL_BASE64, Engine as _};
+
+    #[test]
+    fn cors_request_header_safelist_checks_values() {
+        assert!(is_cors_safelisted_content_type(
+            "application/x-www-form-urlencoded;charset=UTF-8"
+        ));
+        assert!(is_cors_safelisted_content_type(
+            "multipart/form-data; boundary=test"
+        ));
+        assert!(is_cors_safelisted_content_type("text/plain"));
+        assert!(!is_cors_safelisted_content_type("application/json"));
+        assert!(!is_cors_safelisted_content_type("text /plain"));
+
+        assert!(is_cors_safelisted_request_header(
+            "Accept-Language",
+            "en-US, en;q=0.9"
+        ));
+        assert!(!is_cors_safelisted_request_header(
+            "Accept-Language",
+            "en_US"
+        ));
+        assert!(!is_cors_safelisted_request_header(
+            "Accept",
+            &"a".repeat(129)
+        ));
+        assert!(is_cors_safelisted_request_header("Range", "bytes=0-499"));
+        assert!(is_cors_safelisted_request_header("Range", "bytes=500-"));
+        assert!(!is_cors_safelisted_request_header("Range", "bytes=-500"));
+        assert!(!is_cors_safelisted_request_header("Range", "bytes=500-499"));
+        assert!(!is_cors_safelisted_request_header(
+            "Range",
+            "bytes=0-1,4-5"
+        ));
+    }
+
+    #[test]
+    fn cors_unsafe_header_names_are_lowercase_sorted_and_only_include_unsafe_headers() {
+        let headers = HashMap::from([
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("X-Trace".to_string(), "1".to_string()),
+            ("Accept".to_string(), "text/html".to_string()),
+            ("Range".to_string(), "bytes=0-99".to_string()),
+        ]);
+        assert_eq!(
+            cors_unsafe_request_header_names(&headers),
+            vec!["content-type", "x-trace"]
+        );
+    }
+
+    #[test]
+    fn cors_safelist_aggregate_cap_forces_preflight() {
+        let mut headers = HashMap::new();
+        for bits in 0..9u8 {
+            let name = "accept"
+                .bytes()
+                .enumerate()
+                .map(|(index, byte)| {
+                    if bits & (1 << index) == 0 {
+                        byte as char
+                    } else {
+                        (byte as char).to_ascii_uppercase()
+                    }
+                })
+                .collect::<String>();
+            headers.insert(name, "a".repeat(128));
+        }
+        assert_eq!(cors_unsafe_request_header_names(&headers), vec!["accept"]);
+    }
+
+    #[test]
+    fn cors_preflight_permissions_follow_credentials_and_authorization_rules() {
+        assert!(preflight_allows_method(
+            &reqwest::Method::POST,
+            &[],
+            true
+        ));
+        assert!(preflight_allows_method(
+            &reqwest::Method::DELETE,
+            &["DELETE"],
+            true
+        ));
+        assert!(!preflight_allows_method(
+            &reqwest::Method::DELETE,
+            &["delete"],
+            false
+        ));
+        assert!(preflight_allows_method(
+            &reqwest::Method::DELETE,
+            &["*"],
+            false
+        ));
+        assert!(!preflight_allows_method(
+            &reqwest::Method::DELETE,
+            &["*"],
+            true
+        ));
+
+        assert!(preflight_allows_header(
+            "Authorization",
+            &["authorization"],
+            true
+        ));
+        assert!(!preflight_allows_header(
+            "Authorization",
+            &["*"],
+            false
+        ));
+        assert!(preflight_allows_header("X-Trace", &["*"], false));
+        assert!(!preflight_allows_header("X-Trace", &["*"], true));
+    }
+
+    #[test]
+    fn cors_preflight_rejects_malformed_permission_lists() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(
+            "access-control-allow-methods",
+            "GET, DELETE".parse().unwrap(),
+        );
+        headers.append(
+            "access-control-allow-methods",
+            "PATCH".parse().unwrap(),
+        );
+        assert_eq!(
+            parse_cors_header_list(&headers, "access-control-allow-methods"),
+            Some(vec!["GET", "DELETE", "PATCH"])
+        );
+
+        headers.append(
+            "access-control-allow-methods",
+            "@invalid".parse().unwrap(),
+        );
+        assert!(parse_cors_header_list(&headers, "access-control-allow-methods").is_none());
+    }
 
     // #912 — a fulfilled binary body (non-UTF-8) must survive as exact bytes via
     // `bodyBase64`, not be silently corrupted by the lossy `body` text view.
