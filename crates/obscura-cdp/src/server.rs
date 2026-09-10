@@ -964,6 +964,7 @@ async fn cdp_processor(
                             tokio::task::yield_now().await;
                         }
                     }
+                    service_live_page_render_resources(&mut ctx);
                     sync_live_page_network_events(&mut ctx);
                     dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
@@ -1169,6 +1170,17 @@ async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String>
         }
     }
     Ok(all_idle)
+}
+
+/// Apply finished background render-resource loads and start loads for
+/// resources the last layout/paint missed, for every live page. Runs before a
+/// command (so it observes bytes that landed while the client was silent),
+/// after a command (so its layout misses start loading immediately) and after
+/// each autonomous pump turn.
+fn service_live_page_render_resources(ctx: &mut CdpContext) {
+    for page in ctx.pages.iter_mut().filter(|page| page.has_js()) {
+        page.queue_pending_render_resources();
+    }
 }
 
 fn sync_live_page_network_events(ctx: &mut CdpContext) {
@@ -1631,7 +1643,9 @@ async fn process_cdp_message(
 
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
+    service_live_page_render_resources(ctx);
     let response = dispatch::dispatch(&req, ctx).await;
+    service_live_page_render_resources(ctx);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
     // (e.g. Target.targetCreated + Target.attachedToTarget from
