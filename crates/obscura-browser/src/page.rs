@@ -316,6 +316,7 @@ pub struct Page {
     /// Page-owned so the subscription survives replacement of the JS runtime
     /// during navigation.
     runtime_events_enabled: std::cell::Cell<bool>,
+    console_messages_enabled: std::cell::Cell<bool>,
     pending_frame_work: std::collections::VecDeque<PendingFrameWork>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
@@ -1162,6 +1163,7 @@ impl Page {
             intercept_tx: None,
             preload_scripts: Vec::new(),
             runtime_events_enabled: std::cell::Cell::new(false),
+            console_messages_enabled: std::cell::Cell::new(false),
             pending_frame_work: std::collections::VecDeque::new(),
             suspended_started_script_ids: Vec::new(),
             suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
@@ -1863,6 +1865,7 @@ impl Page {
         #[cfg(feature = "render")]
         rt.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
+        rt.set_console_messages_enabled(self.console_messages_enabled.get());
 
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
@@ -4571,10 +4574,24 @@ impl Page {
         }
     }
 
+    pub fn take_pending_console_messages(&mut self) -> Vec<String> {
+        self.js
+            .as_ref()
+            .map(ObscuraJsRuntime::take_pending_console_messages)
+            .unwrap_or_default()
+    }
+
     pub fn set_runtime_events_enabled(&self, enabled: bool) {
         self.runtime_events_enabled.set(enabled);
         if let Some(js) = &self.js {
             js.set_runtime_events_enabled(enabled);
+        }
+    }
+
+    pub fn set_console_messages_enabled(&self, enabled: bool) {
+        self.console_messages_enabled.set(enabled);
+        if let Some(js) = &self.js {
+            js.set_console_messages_enabled(enabled);
         }
     }
 

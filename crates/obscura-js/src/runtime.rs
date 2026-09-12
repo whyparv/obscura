@@ -1245,6 +1245,18 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().runtime_events_enabled = enabled;
     }
 
+    pub fn set_console_messages_enabled(&self, enabled: bool) {
+        self.state.borrow_mut().console_messages_enabled = enabled;
+    }
+
+    pub fn take_pending_console_messages(&self) -> Vec<String> {
+        self.state
+            .borrow_mut()
+            .pending_console_messages
+            .drain(..)
+            .collect()
+    }
+
     fn record_uncaught_exception(&self, error: &deno_core::error::JsError, fallback_url: &str) {
         let mut state = self.state.borrow_mut();
         if !state.runtime_events_enabled {
