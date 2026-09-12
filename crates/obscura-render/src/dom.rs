@@ -3232,7 +3232,7 @@ pub fn layout_dom_with_resources(
     let fonts: Vec<_> = fonts
         .iter()
         .map(|data| crate::inline::WebFont {
-            data: data.clone(),
+            data: std::sync::Arc::new(data.clone()),
             family: None,
             weight: None,
             italic: None,
@@ -19853,7 +19853,9 @@ mod tests {
             (500.0, 150.0),
             &HashMap::new(),
             &[crate::inline::WebFont {
-                data: include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                data: std::sync::Arc::new(
+                    include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                ),
                 family: Some("Fixture".to_string()),
                 weight: Some((400, 400)),
                 italic: Some(false),
@@ -19904,7 +19906,9 @@ mod tests {
             (500.0, 150.0),
             &HashMap::new(),
             &[crate::inline::WebFont {
-                data: include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                data: std::sync::Arc::new(
+                    include_bytes!("../assets/liberation-serif.ttf").to_vec(),
+                ),
                 family: Some("Fixture".to_string()),
                 weight: Some((400, 400)),
                 italic: Some(false),

@@ -9,10 +9,18 @@
 //! whatever width taffy offers. Line wrapping, alignment, and intrinsic
 //! sizing then come from a real text engine instead of flexbox tricks.
 //!
-//! Fonts are loaded from embedded bytes only, never the OS, so layout is
-//! byte-for-byte deterministic across hosts (the whole engine's guarantee).
+//! Fonts are loaded from embedded bytes by default, never implicitly from the
+//! OS, so layout remains deterministic unless the operator supplies fonts.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cosmic_text::{
     Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap,
@@ -188,12 +196,269 @@ struct ResolvedFont {
     synthetic_italic: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct WebFont {
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub family: Option<String>,
     pub weight: Option<(u16, u16)>,
     pub italic: Option<bool>,
+}
+
+type FontDatabase = (
+    cosmic_text::fontdb::Database,
+    HashMap<String, LoadedFamily>,
+);
+type FontDeclaration = (
+    cosmic_text::fontdb::ID,
+    Option<String>,
+    Option<(u16, u16)>,
+    Option<bool>,
+);
+
+const WEB_FONT_CACHE_ENTRIES: usize = 8;
+const WEB_FONT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+struct CachedWebFontSet {
+    signature: u64,
+    load_emoji: bool,
+    fonts: Vec<WebFont>,
+    bytes: usize,
+    database: FontDatabase,
+}
+
+static FONT_DIRECTORIES: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static BASE_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
+static EMOJI_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
+static WEB_FONT_DATABASES: OnceLock<Mutex<VecDeque<Arc<CachedWebFontSet>>>> = OnceLock::new();
+
+#[cfg(test)]
+static BASE_FONT_DATABASE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Configure additional process-wide fonts before the first render.
+///
+/// Returns false when fonts have already been configured or initialized.
+pub fn configure_font_directories(directories: Vec<PathBuf>) -> bool {
+    if BASE_FONT_DATABASE.get().is_some() {
+        return false;
+    }
+    FONT_DIRECTORIES.set(directories).is_ok()
+}
+
+fn load_font_directories(
+    database: &mut cosmic_text::fontdb::Database,
+    directories: &[PathBuf],
+) -> Vec<cosmic_text::fontdb::ID> {
+    let mut pending = directories.to_vec();
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "ttf" | "ttc" | "otf" | "otc"
+                        )
+                    })
+            {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort_unstable();
+    files.dedup();
+    let mut ids = Vec::new();
+    for path in files {
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        ids.extend(database.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(data))));
+    }
+    ids
+}
+
+fn register_loaded_faces(
+    database: &cosmic_text::fontdb::Database,
+    declarations: Vec<FontDeclaration>,
+) -> HashMap<String, LoadedFamily> {
+    let mut loaded_families = HashMap::new();
+    for (id, declared_family, declared_weight, declared_italic) in declarations {
+        let Some(face) = database.face(id) else {
+            continue;
+        };
+        let names = face.families.clone();
+        let internal_name = names
+            .first()
+            .map(|(name, _)| Arc::<str>::from(name.as_str()))
+            .unwrap_or_else(|| Arc::from(FAMILY));
+        let shape_weight = face.weight.0;
+        let metrics = font_metrics(database, id)
+            .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
+        let italic = declared_italic
+            .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
+        let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
+        let declared_names: Vec<String> = declared_family
+            .map(|name| vec![name])
+            .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
+        for name in declared_names {
+            let family = loaded_families
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| LoadedFamily { faces: Vec::new() });
+            family.faces.push(LoadedFace {
+                name: Arc::clone(&internal_name),
+                font_id: Some(id),
+                metrics,
+                min_weight: weight.0,
+                max_weight: weight.1,
+                italic,
+            });
+        }
+    }
+    loaded_families
+}
+
+fn base_font_database(load_emoji: bool) -> &'static FontDatabase {
+    let base = BASE_FONT_DATABASE.get_or_init(|| {
+        #[cfg(test)]
+        BASE_FONT_DATABASE_BUILDS.fetch_add(1, Ordering::Relaxed);
+
+        let mut database = cosmic_text::fontdb::Database::new();
+        let mut declarations = Vec::new();
+        for bytes in [
+            SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
+            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
+        ] {
+            for id in database
+                .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)))
+            {
+                declarations.push((id, None, None, None));
+            }
+        }
+        declarations.extend(
+            load_font_directories(
+                &mut database,
+                FONT_DIRECTORIES.get_or_init(Vec::new),
+            )
+            .into_iter()
+            .map(|id| (id, None, None, None)),
+        );
+        let loaded_families = register_loaded_faces(&database, declarations);
+        database.set_sans_serif_family(FAMILY);
+        (database, loaded_families)
+    });
+
+    if !load_emoji {
+        return base;
+    }
+    EMOJI_FONT_DATABASE.get_or_init(|| {
+        let (mut database, _) = (*base).clone();
+        let declarations = database
+            .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R)))
+            .into_iter()
+            .map(|id| (id, None, None, None))
+            .collect();
+        let loaded_families = register_loaded_faces(&database, declarations);
+        let mut all_loaded_families = base.1.clone();
+        for (name, mut family) in loaded_families {
+            all_loaded_families
+                .entry(name)
+                .or_insert_with(|| LoadedFamily { faces: Vec::new() })
+                .faces
+                .append(&mut family.faces);
+        }
+        (database, all_loaded_families)
+    })
+}
+
+fn web_font_signature(fonts: &[WebFont], load_emoji: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    load_emoji.hash(&mut hasher);
+    fonts.len().hash(&mut hasher);
+    for font in fonts {
+        font.family.hash(&mut hasher);
+        font.weight.hash(&mut hasher);
+        font.italic.hash(&mut hasher);
+        let data = font.data.as_slice();
+        data.len().hash(&mut hasher);
+        data[..data.len().min(64)].hash(&mut hasher);
+        if data.len() > 64 {
+            data[data.len() - 64..].hash(&mut hasher);
+        }
+        if data.len() > 128 {
+            let middle = data.len() / 2;
+            data[middle - 32..middle + 32].hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn cached_web_font_database(
+    fonts: &[WebFont],
+    load_emoji: bool,
+) -> Option<Arc<CachedWebFontSet>> {
+    let signature = web_font_signature(fonts, load_emoji);
+    let candidates: Vec<_> = WEB_FONT_DATABASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|entry| entry.signature == signature && entry.load_emoji == load_emoji)
+        .cloned()
+        .collect();
+    candidates.into_iter().find(|entry| entry.fonts == fonts)
+}
+
+fn cache_web_font_database(
+    fonts: &[WebFont],
+    load_emoji: bool,
+    database: FontDatabase,
+) -> FontDatabase {
+    let bytes = fonts
+        .iter()
+        .fold(0usize, |total, font| total.saturating_add(font.data.len()));
+    if bytes > WEB_FONT_CACHE_BYTES {
+        return database;
+    }
+
+    let signature = web_font_signature(fonts, load_emoji);
+    let mut cache = WEB_FONT_DATABASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = cache.iter().find(|entry| {
+        entry.signature == signature && entry.load_emoji == load_emoji && entry.fonts == fonts
+    }) {
+        return existing.database.clone();
+    }
+    while cache.len() >= WEB_FONT_CACHE_ENTRIES
+        || cache.iter().map(|entry| entry.bytes).sum::<usize>()
+            > WEB_FONT_CACHE_BYTES.saturating_sub(bytes)
+    {
+        cache.pop_front();
+    }
+    cache.push_back(Arc::new(CachedWebFontSet {
+        signature,
+        load_emoji,
+        fonts: fonts.to_vec(),
+        bytes,
+        database: database.clone(),
+    }));
+    database
 }
 
 fn resolve_loaded_font(
@@ -975,7 +1240,7 @@ impl TextEngine {
         let fonts: Vec<_> = fonts
             .iter()
             .map(|data| WebFont {
-                data: data.clone(),
+                data: Arc::new(data.clone()),
                 family: None,
                 weight: None,
                 italic: None,
@@ -989,63 +1254,29 @@ impl TextEngine {
     }
 
     pub(crate) fn new_with_web_fonts_and_emoji(fonts: &[WebFont], load_emoji: bool) -> Self {
-        // Build a database from embedded and page-provided faces. Never call
-        // load_system_fonts: a host's font set would make layout differ
-        // machine to machine and add a multi-millisecond startup scan.
-        let mut db = cosmic_text::fontdb::Database::new();
-        let mut declarations = Vec::new();
-        for bytes in [
-            SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
-            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
-        ] {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
-                declarations.push((id, None, None, None));
+        let (db, loaded_families) = if fonts.is_empty() {
+            (*base_font_database(load_emoji)).clone()
+        } else if let Some(cached) = cached_web_font_database(fonts, load_emoji) {
+            cached.database.clone()
+        } else {
+            let (mut db, mut loaded_families) = (*base_font_database(load_emoji)).clone();
+            let mut declarations = Vec::new();
+            for font in fonts {
+                for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(
+                    font.data.clone(),
+                )) {
+                    declarations.push((id, font.family.clone(), font.weight, font.italic));
+                }
             }
-        }
-        if load_emoji {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R))) {
-                declarations.push((id, None, None, None));
+            for (name, mut family) in register_loaded_faces(&db, declarations) {
+                loaded_families
+                    .entry(name)
+                    .or_insert_with(|| LoadedFamily { faces: Vec::new() })
+                    .faces
+                    .append(&mut family.faces);
             }
-        }
-        for font in fonts {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
-                font.data.clone(),
-            ))) {
-                declarations.push((id, font.family.clone(), font.weight, font.italic));
-            }
-        }
-        let mut loaded_families = HashMap::new();
-        for (id, declared_family, declared_weight, declared_italic) in declarations {
-            let Some(face) = db.face(id) else { continue };
-            let names = face.families.clone();
-            let internal_name = names
-                .first()
-                .map(|(name, _)| Arc::<str>::from(name.as_str()))
-                .unwrap_or_else(|| Arc::from(FAMILY));
-            let shape_weight = face.weight.0;
-            let metrics = font_metrics(&db, id)
-                .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
-            let italic = declared_italic
-                .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
-            let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
-            let declared_names: Vec<String> = declared_family
-                .map(|name| vec![name])
-                .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
-            for name in declared_names {
-                let family = loaded_families
-                    .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| LoadedFamily { faces: Vec::new() });
-                family.faces.push(LoadedFace {
-                    name: Arc::clone(&internal_name),
-                    font_id: Some(id),
-                    metrics,
-                    min_weight: weight.0,
-                    max_weight: weight.1,
-                    italic,
-                });
-            }
-        }
-        db.set_sans_serif_family(FAMILY);
+            cache_web_font_database(fonts, load_emoji, (db, loaded_families))
+        };
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         TextEngine {
             font_system,
@@ -3559,6 +3790,59 @@ mod tests {
     }
 
     #[test]
+    fn embedded_font_database_is_initialized_once() {
+        let _first = TextEngine::new();
+        let _second = TextEngine::new();
+        assert_eq!(BASE_FONT_DATABASE_BUILDS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn repeated_web_font_set_reuses_the_parsed_database() {
+        let font = WebFont {
+            data: Arc::new(FALLBACK.to_vec()),
+            family: Some("Issue 879 cache fixture".to_string()),
+            weight: Some((400, 400)),
+            italic: Some(false),
+        };
+        assert!(cached_web_font_database(std::slice::from_ref(&font), false).is_none());
+        let first = TextEngine::new_with_web_fonts(std::slice::from_ref(&font));
+        assert!(cached_web_font_database(std::slice::from_ref(&font), false).is_some());
+        let second = TextEngine::new_with_web_fonts(std::slice::from_ref(&font));
+        assert_eq!(
+            first.loaded_families["issue 879 cache fixture"].faces[0].metrics,
+            second.loaded_families["issue 879 cache fixture"].faces[0].metrics,
+        );
+
+        let mut different_descriptor = font;
+        different_descriptor.weight = Some((700, 700));
+        assert!(
+            cached_web_font_database(std::slice::from_ref(&different_descriptor), false).is_none()
+        );
+    }
+
+    #[test]
+    fn configured_font_directory_loads_nested_fonts_and_skips_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "obscura-font-directory-test-{}",
+            std::process::id()
+        ));
+        let nested = root.join("nested");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&nested).unwrap();
+        let font = variable_font_fixture();
+        std::fs::write(nested.join("fixture.TTF"), &font).unwrap();
+        std::fs::write(nested.join("ignored.txt"), &font).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, nested.join("cycle")).unwrap();
+
+        assert!(configure_font_directories(vec![root.clone()]));
+        let engine = TextEngine::new();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(engine.loaded_families.contains_key("obscura vf test"));
+    }
+
+    #[test]
     fn text_surface_cull_is_conservative_for_offsets_and_ink_overhang() {
         let (mut engine, item) = surface_cull_fixture();
         assert!(inline_item_may_intersect_surface(
@@ -3762,7 +4046,7 @@ mod tests {
     #[test]
     fn declared_web_family_keeps_the_loaded_faces_line_metrics() {
         let engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: FALLBACK.to_vec(),
+            data: Arc::new(FALLBACK.to_vec()),
             family: Some("Page Face".to_string()),
             weight: Some((400, 400)),
             italic: Some(false),
@@ -4017,7 +4301,7 @@ mod tests {
 
     #[test]
     fn descriptor_selected_resource_pins_the_exact_font_face() {
-        let data = SANS_R.to_vec();
+        let data = Arc::new(SANS_R.to_vec());
         let mut engine = TextEngine::new_with_web_fonts(&[
             WebFont {
                 data: data.clone(),
@@ -4271,7 +4555,7 @@ mod tests {
     #[test]
     fn variable_font_multi_axis_shaping_preserves_space_advance() {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".into()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4306,14 +4590,16 @@ mod tests {
     {
         let mut engine = TextEngine::new_with_web_fonts(&[
             WebFont {
-                data: include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf")
-                    .to_vec(),
+                data: Arc::new(
+                    include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf")
+                        .to_vec(),
+                ),
                 family: Some("Static Primary".to_string()),
                 weight: Some((400, 400)),
                 italic: Some(false),
             },
             WebFont {
-                data: variable_font_fixture(),
+                data: Arc::new(variable_font_fixture()),
                 family: Some("Variable Fallback".to_string()),
                 weight: Some((100, 900)),
                 italic: Some(false),
@@ -4458,7 +4744,7 @@ mod tests {
 
     fn render_variable_weight(weight: u16) -> ((f32, f32), u64, Vec<u16>) {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4552,7 +4838,7 @@ mod tests {
     #[test]
     fn variable_glyph_cache_keys_include_weight_axis() {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4599,7 +4885,7 @@ mod tests {
         width: f32,
     ) -> ((f32, f32), usize, std::collections::HashSet<u32>) {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),
