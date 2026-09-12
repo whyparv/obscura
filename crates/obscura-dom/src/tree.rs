@@ -310,6 +310,31 @@ impl DomTree {
         self.inner.borrow().form_controls.get(&node).cloned()
     }
 
+    pub fn form_control_value_matches(&self, node: NodeId, value: &str) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.value.as_deref())
+            == Some(value)
+    }
+
+    pub fn form_control_checked(&self, node: NodeId) -> Option<bool> {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.checked)
+    }
+
+    pub fn form_control_indeterminate(&self, node: NodeId) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .is_some_and(|control| control.indeterminate)
+    }
+
     pub fn update_form_control_state(&self, node: NodeId, update: impl FnOnce(&mut FormControlState)) {
         let mut inner = self.inner.borrow_mut();
         if inner.nodes.get(node.index()).is_some_and(|entry| entry.as_ref().is_some_and(Node::is_element)) {

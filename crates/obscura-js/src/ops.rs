@@ -753,11 +753,12 @@ fn render_mutation_impact(
             let Some(target) = node(arg1) else {
                 return RenderMutationImpact::default();
             };
-            let control = dom.form_control_state(target).unwrap_or_default();
             let actual_change = match cmd {
-                "set_form_value" => control.value.as_deref() != Some(arg2),
-                "set_form_checked" => control.checked != Some(arg2 == "true"),
-                _ => control.indeterminate != (arg2 == "true"),
+                "set_form_value" => !dom.form_control_value_matches(target, arg2),
+                "set_form_checked" => {
+                    dom.form_control_checked(target) != Some(arg2 == "true")
+                }
+                _ => dom.form_control_indeterminate(target) != (arg2 == "true"),
             };
             RenderMutationImpact { connected: node_is_connected(dom, target), actual_change }
         }
@@ -1529,14 +1530,18 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
     };
 
     match cmd.as_str() {
-        "get_form_value" | "get_form_checked" | "get_form_indeterminate" => {
+        "get_form_state" => {
             let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
-            let control = dom.form_control_state(nid).unwrap_or_default();
-            match cmd.as_str() {
-                "get_form_value" => serde_json::to_string(&control.value).unwrap_or("null".into()),
-                "get_form_checked" => serde_json::to_string(&control.checked).unwrap_or("null".into()),
-                _ => control.indeterminate.to_string(),
-            }
+            dom.form_control_state(nid)
+                .map(|control| {
+                    serde_json::json!({
+                        "value": control.value,
+                        "checked": control.checked,
+                        "indeterminate": control.indeterminate,
+                    })
+                    .to_string()
+                })
+                .unwrap_or_else(|| "null".to_string())
         }
         "set_form_value" | "set_form_checked" | "set_form_indeterminate" => {
             let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));

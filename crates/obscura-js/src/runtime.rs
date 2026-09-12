@@ -4401,14 +4401,19 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
-    fn resetting_an_empty_default_input_clears_live_paint_state() {
-        let mut rt = setup_runtime("<html><body><form id=form><input id=field></form></body></html>");
+    fn form_reset_restores_default_input_state_and_pixels() {
+        let mut rt = setup_runtime(
+            "<html><body><form id=form><input id=field value=default><input id=box type=checkbox checked></form></body></html>",
+        );
         rt.set_viewport(320.0, 120.0);
         let before = rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap();
-        rt.evaluate("document.getElementById('field').value = 'typed'").unwrap();
+        rt.evaluate("const field=document.getElementById('field'),box=document.getElementById('box');field.value='typed';box.checked=false;box.indeterminate=true").unwrap();
         assert_ne!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
         rt.evaluate("document.getElementById('form').reset()").unwrap();
-        assert_eq!(rt.evaluate("document.getElementById('field').value").unwrap(), serde_json::json!(""));
+        assert_eq!(
+            rt.evaluate("[field.value,field.getAttribute('value'),box.checked,box.indeterminate,box.hasAttribute('checked')]").unwrap(),
+            serde_json::json!(["default", "default", true, false, true])
+        );
         assert_eq!(before, rt.screenshot_prepared((320.0, 120.0), Some("http://example.com/test")).unwrap());
     }
 

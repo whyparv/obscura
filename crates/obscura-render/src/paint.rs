@@ -4715,17 +4715,22 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        let input_type = node.get_attribute("type").unwrap_or("text").to_ascii_lowercase();
-        let checkable = name.local.as_ref() == "input" && matches!(input_type.as_str(), "checkbox" | "radio");
+        let input_type = (name.local.as_ref() == "input")
+            .then(|| node.get_attribute("type").unwrap_or("text"));
+        let checkable = input_type.is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
+        });
         if checkable && rect.width > 0.0 && rect.height > 0.0 {
-            let control = tree.form_control_state(nid).unwrap_or_default();
-            let checked = control.checked.unwrap_or_else(|| node.get_attribute("checked").is_some());
-            let indeterminate = input_type == "checkbox" && control.indeterminate;
+            let checked = tree
+                .form_control_checked(nid)
+                .unwrap_or_else(|| node.get_attribute("checked").is_some());
+            let is_radio = input_type.is_some_and(|kind| kind.eq_ignore_ascii_case("radio"));
+            let indeterminate = !is_radio && tree.form_control_indeterminate(nid);
             let disabled = node.get_attribute("disabled").is_some();
             let size = rect.width.min(rect.height);
             let x = rect.x + (rect.width - size) / 2.0;
             let y = rect.y + (rect.height - size) / 2.0;
-            let shape = if input_type == "radio" {
+            let shape = if is_radio {
                 PathBuilder::from_circle(x + size / 2.0, y + size / 2.0, (size - 1.0).max(0.0) / 2.0)
             } else {
                 tiny_skia::Rect::from_xywh(x + 0.5, y + 0.5, (size - 1.0).max(0.0), (size - 1.0).max(0.0))
@@ -4738,13 +4743,13 @@ fn paint_laid_dom_scrolled(
                 control_paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
                 control_paint.anti_alias = true;
                 let stroke = tiny_skia::Stroke { width: 1.0, ..Default::default() };
-                if input_type == "checkbox" && selected {
+                if !is_radio && selected {
                     pixmap.fill_path(&shape, &control_paint, FillRule::Winding, raster_transform(raster_scale), element_clip_mask);
                 } else {
                     pixmap.stroke_path(&shape, &control_paint, &stroke, raster_transform(raster_scale), element_clip_mask);
                 }
                 if selected {
-                    if input_type == "radio" {
+                    if is_radio {
                         if let Some(dot) = PathBuilder::from_circle(x + size / 2.0, y + size / 2.0, size * 0.25) {
                             pixmap.fill_path(&dot, &control_paint, FillRule::Winding, raster_transform(raster_scale), element_clip_mask);
                         }
@@ -4792,10 +4797,8 @@ fn paint_laid_dom_scrolled(
                         let text_y = rect.y + style.padding.top + style.border.top;
                         let color = style.color.unwrap_or([0, 0, 0, 255]);
                         let masked;
-                        let shown = if node
-                            .get_attribute("type")
-                            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
-                        {
+                        let shown = if input_type
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("password")) {
                             masked = "\u{2022}".repeat(value.chars().count());
                             masked.as_str()
                         } else {
