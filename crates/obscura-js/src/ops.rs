@@ -749,6 +749,19 @@ fn render_mutation_impact(
 ) -> RenderMutationImpact {
     let node = |value: &str| value.parse::<u32>().ok().map(NodeId::new);
     match cmd {
+        "set_form_value" | "set_form_checked" | "set_form_indeterminate" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            let actual_change = match cmd {
+                "set_form_value" => !dom.form_control_value_matches(target, arg2),
+                "set_form_checked" => {
+                    dom.form_control_checked(target) != Some(arg2 == "true")
+                }
+                _ => dom.form_control_indeterminate(target) != (arg2 == "true"),
+            };
+            RenderMutationImpact { connected: node_is_connected(dom, target), actual_change }
+        }
         "set_attribute" => {
             let Some(target) = node(arg1) else {
                 return RenderMutationImpact::default();
@@ -1192,6 +1205,9 @@ fn is_render_mutation_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "set_attribute"
+            | "set_form_value"
+            | "set_form_checked"
+            | "set_form_indeterminate"
             | "remove_attribute"
             | "set_attribute_ns"
             | "remove_attribute_ns"
@@ -1514,6 +1530,28 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
     };
 
     match cmd.as_str() {
+        "get_form_state" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.form_control_state(nid)
+                .map(|control| {
+                    serde_json::json!({
+                        "value": control.value,
+                        "checked": control.checked,
+                        "indeterminate": control.indeterminate,
+                    })
+                    .to_string()
+                })
+                .unwrap_or_else(|| "null".to_string())
+        }
+        "set_form_value" | "set_form_checked" | "set_form_indeterminate" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.update_form_control_state(nid, |control| match cmd.as_str() {
+                "set_form_value" => control.value = Some(arg2.clone()),
+                "set_form_checked" => control.checked = Some(arg2 == "true"),
+                _ => control.indeterminate = arg2 == "true",
+            });
+            "null".to_string()
+        }
         "document_node_id" => dom.document().index().to_string(),
         "document_title" => {
             // The DOM is authoritative after parsing. In particular, script

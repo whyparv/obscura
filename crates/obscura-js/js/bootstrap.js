@@ -705,6 +705,17 @@ const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+const _formStateLoaded = new Set();
+function _loadFormState(nid) {
+  if (_formStateLoaded.has(nid)) return;
+  const state = _domParse("get_form_state", nid);
+  if (state) {
+    if (state.value !== null) _formValues[nid] = state.value;
+    if (state.checked !== null) _formChecked[nid] = state.checked;
+    if (state.indeterminate) _formIndeterminate[nid] = true;
+  }
+  _formStateLoaded.add(nid);
+}
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
@@ -3972,6 +3983,7 @@ class Element extends Node {
       if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
       return '';
     }
+    if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
@@ -4023,9 +4035,11 @@ class Element extends Node {
       }
       return;
     }
-    _formValues[this._nid] = String(v);
+    const value = String(v);
+    _formValues[this._nid] = value;
+    _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
-      this.textContent = String(v);
+      this.textContent = value;
     }
   }
   get min() { return this.getAttribute('min') || ''; }
@@ -4101,17 +4115,28 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
+    if (_formChecked[this._nid] === undefined) _loadFormState(this._nid);
     if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
     return this.hasAttribute("checked");
   }
-  set checked(v) { _formChecked[this._nid] = !!v; }
+  set checked(v) {
+    const checked = !!v;
+    _formChecked[this._nid] = checked;
+    _dom("set_form_checked", this._nid, String(checked));
+  }
   // `indeterminate` is IDL-only: it has no content attribute to reflect, so
   // the property itself must exist on the prototype for `'indeterminate' in
-  // el` to be true on a freshly created element. It is node-keyed like
-  // `checked` because element wrappers are rebuilt on each lookup, so a
-  // per-instance field would not survive getElementById returning a new one.
-  get indeterminate() { return _formIndeterminate[this._nid] === true; }
-  set indeterminate(v) { _formIndeterminate[this._nid] = !!v; }
+  // el` to be true on a freshly created element. Native node-keyed state
+  // keeps IDL access and rendering consistent without changing attributes.
+  get indeterminate() {
+    if (_formIndeterminate[this._nid] === undefined) _loadFormState(this._nid);
+    return _formIndeterminate[this._nid] === true;
+  }
+  set indeterminate(v) {
+    const indeterminate = !!v;
+    _formIndeterminate[this._nid] = indeterminate;
+    _dom("set_form_indeterminate", this._nid, String(indeterminate));
+  }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
@@ -11633,7 +11658,22 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
   // 'submit' event and (if not prevented) builds form data and navigates.
-  reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
+  reset() {
+    if (!this.dispatchEvent(new Event('reset', { bubbles: true, cancelable: true }))) return;
+    for (const f of this.elements) {
+      if (f.localName === 'input') {
+        const type = (f.getAttribute('type') || 'text').toLowerCase();
+        if (type === 'checkbox' || type === 'radio') {
+          f.checked = f.hasAttribute('checked');
+          f.indeterminate = false;
+        } else {
+          f.value = f.getAttribute('value') || '';
+        }
+      } else if ('value' in f) {
+        f.value = '';
+      }
+    }
+  }
 };
 globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
