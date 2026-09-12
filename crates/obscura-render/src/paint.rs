@@ -7305,17 +7305,23 @@ fn fetch_and_decode_font(
     src: &str,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
-) -> Option<Vec<u8>> {
+) -> Option<std::sync::Arc<Vec<u8>>> {
     let compressed = fetch_font_bytes(src, base_url, cache)?;
     if compressed.len() > 8 * 1024 * 1024 {
         return None;
     }
     let decoded = match compressed.get(..4) {
-        Some(b"wOF2") => wuff::decompress_woff2(&compressed).ok(),
-        Some(b"wOFF") => wuff::decompress_woff1(&compressed).ok(),
+        Some(b"wOF2") => wuff::decompress_woff2(&compressed)
+            .ok()
+            .map(std::sync::Arc::new),
+        Some(b"wOFF") => wuff::decompress_woff1(&compressed)
+            .ok()
+            .map(std::sync::Arc::new),
         // TrueType/OpenType collections and raw sfnt fonts already have the
         // representation fontdb expects.
-        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => Some(compressed.as_ref().to_vec()),
+        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => {
+            Some(std::sync::Arc::new(compressed.as_ref().to_vec()))
+        }
         _ => None,
     }?;
     (decoded.len() <= 32 * 1024 * 1024).then_some(decoded)
@@ -10367,7 +10373,7 @@ fn svg_font_database_with_web_fonts(
     // is the cost of keeping the rasterizer and layout engine deterministic.
     let mut database = (*base).clone();
     for font in web_fonts {
-        database.load_font_data(font.data.clone());
+        database.load_font_data(font.data.as_ref().clone());
     }
     std::sync::Arc::new(database)
 }
@@ -15720,7 +15726,7 @@ mod tests {
 
         assert_eq!(fonts.len(), 1);
         assert_eq!(fonts[0].family.as_deref(), Some("Fixture"));
-        assert_eq!(fonts[0].data, SERIF_FONT_BYTES);
+        assert_eq!(fonts[0].data.as_slice(), SERIF_FONT_BYTES);
         assert_eq!(
             *loads.lock().expect("font loads"),
             vec![

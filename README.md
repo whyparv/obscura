@@ -476,6 +476,7 @@ Start a CDP WebSocket server.
 | `--proxy` | — | HTTP/SOCKS5 proxy URL |
 | `--stealth` | off | Enable anti-detection + tracker blocking |
 | `--workers` | `1` | Number of parallel worker processes |
+| `--font-dir` | — | Recursively load fonts once per worker (repeatable; render build) |
 | `--obey-robots` | off | Respect robots.txt |
 
 ### `obscura fetch <URL>`
