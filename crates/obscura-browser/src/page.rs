@@ -5909,10 +5909,11 @@ mod tests {
             page_with_fetched_slow_frames("cancel-frame-scripts", 2).await;
         page.add_preload_script("globalThis.__order = ['preload'];");
         assert!(page.queue_pending_frames());
-        let expected_viewport = match &page.pending_frame_work[0] {
-            PendingFrameWork::Unattached(frame) => {
-                (frame.viewport_width, frame.viewport_height)
-            }
+        let (attached_frame_id, expected_viewport) = match &page.pending_frame_work[0] {
+            PendingFrameWork::Unattached(frame) => (
+                frame.frame_id,
+                (frame.viewport_width, frame.viewport_height),
+            ),
             PendingFrameWork::Attached { .. } => panic!("frame work started before advancement"),
         };
         let slow_request = slow_seen.notified();
@@ -5930,10 +5931,14 @@ mod tests {
             .js
             .as_mut()
             .unwrap()
-            .evaluate(
-                "(function(){ const w = document.querySelector('iframe').contentWindow; \
-                 return { order: w.__order, width: w.innerWidth, height: w.innerHeight }; })()",
-            )
+            .evaluate(&format!(
+                "(function(){{ \
+                       const frame = Array.from(document.querySelectorAll('iframe')) \
+                         .find(frame => frame._frameId === {attached_frame_id}); \
+                       const w = frame.contentWindow; \
+                       return {{ order: w.__order, width: w.innerWidth, height: w.innerHeight }}; \
+                     }})()"
+            ))
             .unwrap();
         assert_eq!(
             observable,
@@ -5942,7 +5947,7 @@ mod tests {
                 "width": expected_viewport.0,
                 "height": expected_viewport.1,
             }),
-            "a published loading frame was observable before new-document initialization",
+            "the attached loading frame was observable before new-document initialization",
         );
         assert_eq!(page.pending_frame_work.len(), 2);
         assert!(matches!(
