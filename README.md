@@ -30,7 +30,7 @@ Obscura is a headless browser engine written in Rust, built for web scraping and
 | Metric       | Obscura      | Headless Chrome |
 |--------------|--------------|------------------|
 | Memory       | **30 MB**    | 200+ MB          |
-| Binary size  | **70 MB**    | 300+ MB          |
+| Binary size  | **~70 MiB**  | 300+ MB          |
 | Anti-detect  | **Built-in** | None          |
 | Page load    | **85 ms**    | ~500 ms          |
 | Startup      | **Instant**  | ~2s              |
