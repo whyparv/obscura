@@ -96,7 +96,27 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       <b>OBSCURA35</b> - 35% off to Mobile and Residential Proxies<br>
       <b>OBSCURA40</b> - 40% off to ISP (Static) Proxies
     </td>
-  </tr>
+ <tr>
+  <td width="200" align="center" valign="middle">
+    <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub" target="_blank">
+      <img alt="ProxyEmpire" src="assets/sponsors/proxyempire.png" width="180"/>
+    </a>
+  </td>
+  <td valign="middle">
+    🚀 <b>Obscura × ProxyEmpire</b><br>
+    Using Obscura for AI agents, browser automation, or web scraping? Power it with reliable residential and mobile proxies from <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub"><b>ProxyEmpire</b></a>.<br><br>
+    <b>
+      🌍 30M+ residential IPs in 170+ countries<br>
+      📱 4G/5G mobile proxies<br>
+      🔄 Rotating & sticky sessions<br>
+      🎯 City, region & ISP targeting<br>
+      🔐 HTTP, HTTPS & SOCKS5 support<br><br>
+      🎁 Use code <b>OBSCURA35</b> for a <b>35% recurring discount</b>.<br><br>
+    </b>
+    Better proxies. Fewer blocks. More scalable automation.
+  </td>
+</tr>
+   </tr>
     <td width="200" align="center" valign="middle">
       <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura" target="_blank">
         <img alt="NiuProxy" src="assets/sponsors/niuproxlogo.png" width="180"/>
@@ -105,8 +125,8 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
     <td valign="middle">
       <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura"><b>NiuProxy</b></a> Rotating Residential Proxies — Special Offer: 10TB at $0.35/GB | 1TB at $0.50/GB.<br><br>
       🎁 Use code <b>PAY2</b> for <b>10% off</b> your recharge.
-    </td>
-  </tr>
+    </td>  
+</tr>
     <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://masklabs.io" target="_blank">
