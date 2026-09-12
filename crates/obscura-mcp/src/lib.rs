@@ -1164,6 +1164,7 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
 
 fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     let page = state.page_mut();
+    page.sync_js_network_events();
     let events = &page.network_events;
 
     if events.is_empty() {
@@ -2249,6 +2250,43 @@ mod tests {
         assert!(
             submitted.contains("q=hello"),
             "the submitted body must carry the filled field, got {submitted}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_tool_includes_completed_script_fetches() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(&base)
+            .await
+            .expect("test page should navigate");
+        requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the test page itself must be fetched");
+
+        let fetch_url = serde_json::to_string(&format!("{base}/script-request"))
+            .expect("fetch URL should serialize");
+        state.page_mut().evaluate(&format!(
+            "fetch({fetch_url}).then(() => document.body.id = 'fetch-complete')"
+        ));
+        tool_wait_for(
+            &json!({ "selector": "#fetch-complete", "timeout": 2 }),
+            &mut state,
+        )
+        .await
+        .expect("script fetch should complete");
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the script fetch must reach the server");
+        assert!(request.starts_with("GET /script-request"), "got {request}");
+
+        let output = tool_network_requests(&mut state).expect("network tool should succeed");
+        assert!(
+            output.contains("/script-request"),
+            "completed script fetch missing from network history: {output}"
         );
     }
 
