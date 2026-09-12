@@ -52,6 +52,7 @@
     // Pre-declaring them non-enumerable here is enough -- per the note above,
     // the later `globalThis.X = X` assignments only update the value.
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
+    'Navigator', 'PluginArray', 'Plugin', 'MimeType', 'MimeTypeArray',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
     'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
@@ -6777,6 +6778,12 @@ Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'Mime
 _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
+
+globalThis.Navigator = Navigator;
+globalThis.PluginArray = PluginArray;
+globalThis.Plugin = Plugin;
+globalThis.MimeType = MimeType;
+globalThis.MimeTypeArray = MimeTypeArray;
 
 class NetworkInformation {
   constructor() { this._listeners = Object.create(null); }

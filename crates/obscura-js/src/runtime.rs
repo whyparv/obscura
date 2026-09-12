@@ -15548,6 +15548,26 @@ mod tests {
         assert_eq!(wd, serde_json::json!(false));
         let plugins = rt.evaluate("navigator.plugins.length").unwrap();
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
+        let plugin_interfaces = rt
+            .evaluate(
+                r#"({
+                    Navigator: typeof Navigator,
+                    PluginArray: typeof PluginArray,
+                    Plugin: typeof Plugin,
+                    MimeType: typeof MimeType,
+                    MimeTypeArray: typeof MimeTypeArray,
+                    pluginsMatch: navigator.plugins instanceof PluginArray,
+                    enumerable: Object.getOwnPropertyDescriptor(window, "PluginArray").enumerable,
+                })"#,
+            )
+            .unwrap();
+        assert_eq!(plugin_interfaces["Navigator"], "function");
+        assert_eq!(plugin_interfaces["PluginArray"], "function");
+        assert_eq!(plugin_interfaces["Plugin"], "function");
+        assert_eq!(plugin_interfaces["MimeType"], "function");
+        assert_eq!(plugin_interfaces["MimeTypeArray"], "function");
+        assert_eq!(plugin_interfaces["pluginsMatch"], true);
+        assert_eq!(plugin_interfaces["enumerable"], false);
         let chrome = rt.evaluate("typeof window.chrome").unwrap();
         assert_eq!(chrome, serde_json::json!("object"));
     }
