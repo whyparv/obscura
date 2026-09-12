@@ -140,6 +140,8 @@ pub struct ObscuraState {
     // The CDP layer drains this after commands and autonomous event-loop turns.
     pub pending_runtime_events: VecDeque<RuntimeEvent>,
     pub runtime_events_enabled: bool,
+    pub pending_console_messages: VecDeque<String>,
+    pub console_messages_enabled: bool,
     pub runtime_exception_counter: u64,
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
@@ -356,6 +358,8 @@ impl ObscuraState {
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
             runtime_events_enabled: false,
+            pending_console_messages: VecDeque::new(),
+            console_messages_enabled: false,
             runtime_exception_counter: 0,
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
@@ -2291,6 +2295,13 @@ fn op_console_msg(
 
     let page = state.borrow::<SharedState>().clone();
     let mut page = page.borrow_mut();
+    if page.console_messages_enabled {
+        if page.pending_console_messages.len() >= 1_024 {
+            page.pending_console_messages.pop_front();
+        }
+        page.pending_console_messages
+            .push_back(format!("[{level}] {msg}"));
+    }
     if !page.runtime_events_enabled {
         return;
     }
