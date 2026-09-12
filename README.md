@@ -140,9 +140,6 @@ tar xzf obscura-x86_64-linux.tar.gz
 curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
 tar xzf obscura-aarch64-linux.tar.gz
 
-# Arch Linux (AUR)
-yay -S obscura-browser
-
 # NixOS
 nix-env -iA nixpkgs.obscura
 
