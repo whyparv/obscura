@@ -184,14 +184,7 @@ pub async fn handle(
                 return Err("nodeId or objectId required".to_string());
             };
 
-            let js_code = format!(
-                "(function() {{\
-                    var nid = {};\
-                    var t = +Deno.core.ops.op_dom('node_type', String(nid), '', globalThis.__obscura_frameId >>> 0);\
-                    return t === 9 ? globalThis.document : globalThis._wrap(nid);\
-                }})()",
-                node_id,
-            );
+            let js_code = format!("globalThis._wrap({node_id})");
 
             let info = if let Some(js) = &mut page.js {
                 match js.store_object_with_meta(&js_code) {
@@ -647,17 +640,64 @@ mod tests {
         crate::domains::page::handle("navigate", &json!({
             "url": "data:text/html,<html><body><textarea id=field></textarea><a id=link href=https://example.com>Next</a></body></html>"
         }), &mut ctx, &session).await.unwrap();
-        for id in ["field", "link"] {
+        for (id, constructor) in [
+            ("field", "HTMLTextAreaElement"),
+            ("link", "HTMLAnchorElement"),
+        ] {
             let selector = format!("#{id}");
-            let query = handle("querySelector", &json!({"selector": selector}), &mut ctx, &session).await.unwrap();
-            let resolved = handle("resolveNode", &json!({"backendNodeId": query["nodeId"]}), &mut ctx, &session).await.unwrap();
+            let query = handle(
+                "querySelector",
+                &json!({"selector": selector}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+            let resolved = handle(
+                "resolveNode",
+                &json!({"backendNodeId": query["nodeId"]}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .unwrap();
             let object_id = resolved["object"]["objectId"].as_str().unwrap();
             let expression = format!(
-                "globalThis.__obscura_objects[{}] === document.getElementById({})",
-                serde_json::to_string(object_id).unwrap(), serde_json::to_string(id).unwrap()
+                "(() => {{ const node = globalThis.__obscura_objects[{}]; return node === document.getElementById({}) && node instanceof {}; }})()",
+                serde_json::to_string(object_id).unwrap(),
+                serde_json::to_string(id).unwrap(),
+                constructor
             );
-            assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(&expression), json!(true));
+            assert_eq!(
+                ctx.get_session_page_mut(&session)
+                    .unwrap()
+                    .evaluate(&expression),
+                json!(true)
+            );
         }
+
+        let document = handle("getDocument", &json!({}), &mut ctx, &session)
+            .await
+            .unwrap();
+        let resolved = handle(
+            "resolveNode",
+            &json!({"nodeId": document["root"]["nodeId"]}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let object_id = resolved["object"]["objectId"].as_str().unwrap();
+        let expression = format!(
+            "globalThis.__obscura_objects[{}] === document",
+            serde_json::to_string(object_id).unwrap()
+        );
+        assert_eq!(
+            ctx.get_session_page_mut(&session)
+                .unwrap()
+                .evaluate(&expression),
+            json!(true)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
