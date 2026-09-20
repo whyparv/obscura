@@ -968,12 +968,15 @@ fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
 /// Attach CSSOM state and dispatch load for a host-fetched linked sheet.
 /// Fetched bytes live in native DOM state, never in a synthetic `<style>` that
 /// page script could read.
-fn register_linked_stylesheet_script(link_index: usize, response_url: &str) -> String {
+fn register_linked_stylesheet_script(link_nid: usize, response_url: &str) -> String {
     let response_url = serde_json::to_string(response_url).unwrap_or_else(|_| "null".to_string());
     format!(
         r#"(function() {{
             var links = document.querySelectorAll('link[rel~="stylesheet"]');
-            var link = links[{link_index}];
+            var link = null;
+            for (var i = 0; i < links.length; i++) {{
+                if (links[i]._nid === {link_nid}) {{ link = links[i]; break; }}
+            }}
             if (!link) return;
             function syncSheet() {{
                 if (Object.prototype.hasOwnProperty.call(link, 'media')) {{
@@ -998,14 +1001,15 @@ fn register_linked_stylesheet_script(link_index: usize, response_url: &str) -> S
 /// Discover linked author sheets in document order.
 ///
 /// Media queries control whether a loaded sheet participates in the cascade;
-/// they do not suppress its fetch or `load` event. Keep the index among all
-/// stylesheet links so the materialization script addresses the same node.
+/// they do not suppress its fetch or `load` event. Each request carries the
+/// link's node id (not a query-order index) so the materialization script
+/// addresses the same node even if a load handler mutates the link list (#1044).
 fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
     let link_ids = dom
         .query_selector_all("link[rel~=\"stylesheet\"]")
         .unwrap_or_default();
     let mut links = Vec::new();
-    for (link_index, lid) in link_ids.into_iter().enumerate() {
+    for lid in link_ids {
         if let Some(node) = dom.get_node(lid) {
             // Disabled alternate sheets remain dormant until script enables
             // them. Media-gated sheets are different: they still load.
@@ -1013,7 +1017,7 @@ fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
                 continue;
             }
             if let Some(href) = node.get_attribute("href") {
-                links.push((link_index, href.to_string()));
+                links.push((lid.index() as usize, href.to_string()));
             }
         }
     }
@@ -3388,17 +3392,22 @@ impl Page {
         if !author_stylesheets.is_empty() {
             if let Some(js) = &mut self.js {
                 js.with_dom(|dom| {
-                    let links = dom
-                        .query_selector_all("link[rel~=\"stylesheet\"]")
-                        .unwrap_or_default();
                     let styles = dom.query_selector_all("style").unwrap_or_default();
                     for (target, css, origin_clean, _) in &author_stylesheets {
+                        // Linked targets carry the link's node id (#1044), so
+                        // resolve it directly instead of indexing a query-order
+                        // list. InlineImport still uses the style query index.
                         let owner = match target {
-                            AuthorStylesheetTarget::Linked(index) => links.get(*index),
-                            AuthorStylesheetTarget::InlineImport(index) => styles.get(*index),
+                            AuthorStylesheetTarget::Linked(nid) => {
+                                let id = obscura_dom::NodeId::new(*nid as u32);
+                                dom.get_node(id).map(|_| id)
+                            }
+                            AuthorStylesheetTarget::InlineImport(index) => {
+                                styles.get(*index).copied()
+                            }
                         };
                         if let Some(owner) = owner {
-                            dom.append_external_stylesheet(*owner, css.clone(), *origin_clean);
+                            dom.append_external_stylesheet(owner, css.clone(), *origin_clean);
                         }
                     }
                 });
@@ -4779,20 +4788,71 @@ mod tests {
         origin_clean: bool,
         response_url: &str,
     ) {
-        runtime
+        let link_nid = runtime
             .with_dom(|dom| {
                 let links = dom
                     .query_selector_all(r#"link[rel~="stylesheet"]"#)
                     .expect("valid selector");
-                dom.replace_external_stylesheet(links[index], css.to_string(), origin_clean)
+                let lid = links[index];
+                let _ = dom.replace_external_stylesheet(lid, css.to_string(), origin_clean);
+                lid.index() as usize
             })
             .expect("live DOM");
         runtime
             .execute_script(
                 "<linked-sheet>",
-                &register_linked_stylesheet_script(index, response_url),
+                &register_linked_stylesheet_script(link_nid, response_url),
             )
             .expect("register linked sheet");
+    }
+
+    // #1044: registration must address the <link> by its node id, not a
+    // query-order index that a load handler can shift.
+    #[test]
+    fn register_linked_stylesheet_addresses_the_node_by_nid() {
+        let mut rt = obscura_js::runtime::ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<html><body><link id="a" rel="stylesheet" href="/a.css"><link id="b" rel="stylesheet" href="/b.css"></body></html>"#,
+        ));
+        rt.set_url("http://example.com/");
+        rt.run_page_init();
+
+        // Attach load handlers to both links, then register against b's node
+        // id. The node id is not the query-order index (it counts every node
+        // before the link), so an index-based lookup (`links[b_nid]`) would
+        // miss the element entirely and fire nothing.
+        let b_nid = rt
+            .evaluate(
+                r#"(() => {
+            const a = document.getElementById('a');
+            const b = document.getElementById('b');
+            a.addEventListener('load', () => a.setAttribute('data-loaded', 'yes'));
+            b.addEventListener('load', () => b.setAttribute('data-loaded', 'yes'));
+            return b._nid;
+        })()"#,
+            )
+            .unwrap()
+            .as_f64()
+            .expect("b nid is a number") as usize;
+        assert!(
+            b_nid >= 2,
+            "node id must exceed the two-element query index for this test to be meaningful",
+        );
+
+        rt.execute_script(
+            "<linked-sheet>",
+            &register_linked_stylesheet_script(b_nid, "http://example.com/b.css"),
+        )
+        .expect("register linked sheet");
+
+        let b_loaded = rt
+            .evaluate(r#"document.getElementById('b').getAttribute('data-loaded')"#)
+            .unwrap();
+        let a_loaded = rt
+            .evaluate(r#"document.getElementById('a').getAttribute('data-loaded')"#)
+            .unwrap();
+        assert_eq!(b_loaded.as_str(), Some("yes"), "load fired on the target link");
+        assert_eq!(a_loaded.as_str(), None, "load did not fire on the other link");
     }
 
     #[test]
@@ -8886,14 +8946,21 @@ mod tests {
                <link rel="stylesheet" href="disabled.css" disabled>"#,
         );
 
-        assert_eq!(
-            linked_stylesheet_requests(&dom),
-            vec![
-                (0, "screen.css".to_string()),
-                (1, "async.css".to_string()),
-                (2, "dark.css".to_string()),
-            ]
-        );
+        let requests = linked_stylesheet_requests(&dom);
+
+        // Media-gated sheets still load; the disabled sheet is skipped. Order
+        // follows document order.
+        let hrefs: Vec<&str> = requests.iter().map(|(_, href)| href.as_str()).collect();
+        assert_eq!(hrefs, vec!["screen.css", "async.css", "dark.css"]);
+
+        // Each request carries the link's node id (#1044), so it must resolve
+        // back to that exact node, not a query-order position.
+        for (nid, href) in &requests {
+            let node = dom
+                .get_node(obscura_dom::NodeId::new(*nid as u32))
+                .expect("node id resolves to a live node");
+            assert_eq!(node.get_attribute("href"), Some(href.as_str()));
+        }
     }
 
     #[test]
