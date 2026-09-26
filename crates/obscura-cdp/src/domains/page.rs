@@ -1360,7 +1360,21 @@ pub async fn handle(
 
             Ok(json!({ "executionContextId": context.id }))
         }
-        "setLifecycleEventsEnabled" => Ok(json!({})),
+        "setLifecycleEventsEnabled" => {
+            let enabled = params.get("enabled").and_then(Value::as_bool)
+                .ok_or("enabled must be a boolean")?;
+            if let Some(session) = session_id {
+                if !ctx.sessions.contains_key(session) {
+                    return Err("Unknown page session".to_string());
+                }
+                if enabled {
+                    ctx.lifecycle_enabled_sessions.insert(session.clone());
+                } else {
+                    ctx.lifecycle_enabled_sessions.remove(session);
+                }
+            }
+            Ok(json!({}))
+        }
         "addScriptToEvaluateOnNewDocument" => {
             let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
             ctx.preload_counter += 1;

@@ -1468,7 +1468,9 @@ fn op_dom(
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
     if cmd == "document_lifecycle" {
         let mut state = shared.borrow_mut();
-        if state.runtime_events_enabled && matches!(arg1.as_str(), "init" | "DOMContentLoaded" | "load") {
+        // Page lifecycle collection is independent of Runtime.enable.
+        // The queue remains bounded; CDP filters delivery by Page subscription.
+        if matches!(arg1.as_str(), "init" | "DOMContentLoaded" | "load") {
             if state.pending_runtime_events.len() >= 1_024 {
                 state.pending_runtime_events.pop_front();
             }
