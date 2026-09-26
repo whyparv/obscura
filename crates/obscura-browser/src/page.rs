@@ -107,7 +107,7 @@ use obscura_net::StealthHttpClient;
 /// non-file scheme into a file: URL. We treat that move as an SOP
 /// violation because the existing realm survives the navigation and
 /// can read the new document's body.
-fn cross_scheme_to_file(from: &str, to: &str) -> bool {
+pub(crate) fn cross_scheme_to_file(from: &str, to: &str) -> bool {
     let to_is_file = Url::parse(to)
         .map(|u| u.scheme().eq_ignore_ascii_case("file"))
         .unwrap_or(false);
@@ -117,6 +117,14 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
     Url::parse(from)
         .map(|u| !u.scheme().eq_ignore_ascii_case("file"))
         .unwrap_or(true)
+}
+
+/// Whether a navigation target is a local file, including spellings the URL
+/// parser rejects (a bare `file:` prefix) so they cannot slip past the gate.
+fn url_is_file_scheme(raw: &str) -> bool {
+    Url::parse(raw)
+        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or_else(|_| raw.trim_start().to_ascii_lowercase().starts_with("file:"))
 }
 
 /// Sub-resource fetch policy. http(s) is always fine; data: is allowed
@@ -301,6 +309,11 @@ pub struct Page {
     /// page's V8 runtime. Chromium keeps these handles alive with the target;
     /// preserving them avoids order-dependent failures in concurrent clients.
     suspended_cdp_object_state: obscura_js::runtime::CdpObjectState,
+    /// Console messages drained from the runtime when the page is suspended for
+    /// tab switching, so they are not lost when the runtime is dropped (#971).
+    /// Retrieved (and cleared) alongside the live messages by
+    /// `take_pending_console_messages`.
+    suspended_console_messages: Vec<String>,
     /// Passive on_request/on_response callbacks, scoped to this page (issue
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
@@ -968,12 +981,15 @@ fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
 /// Attach CSSOM state and dispatch load for a host-fetched linked sheet.
 /// Fetched bytes live in native DOM state, never in a synthetic `<style>` that
 /// page script could read.
-fn register_linked_stylesheet_script(link_index: usize, response_url: &str) -> String {
+fn register_linked_stylesheet_script(link_nid: usize, response_url: &str) -> String {
     let response_url = serde_json::to_string(response_url).unwrap_or_else(|_| "null".to_string());
     format!(
         r#"(function() {{
             var links = document.querySelectorAll('link[rel~="stylesheet"]');
-            var link = links[{link_index}];
+            var link = null;
+            for (var i = 0; i < links.length; i++) {{
+                if (links[i]._nid === {link_nid}) {{ link = links[i]; break; }}
+            }}
             if (!link) return;
             function syncSheet() {{
                 if (Object.prototype.hasOwnProperty.call(link, 'media')) {{
@@ -998,14 +1014,15 @@ fn register_linked_stylesheet_script(link_index: usize, response_url: &str) -> S
 /// Discover linked author sheets in document order.
 ///
 /// Media queries control whether a loaded sheet participates in the cascade;
-/// they do not suppress its fetch or `load` event. Keep the index among all
-/// stylesheet links so the materialization script addresses the same node.
+/// they do not suppress its fetch or `load` event. Each request carries the
+/// link's node id (not a query-order index) so the materialization script
+/// addresses the same node even if a load handler mutates the link list (#1044).
 fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
     let link_ids = dom
         .query_selector_all("link[rel~=\"stylesheet\"]")
         .unwrap_or_default();
     let mut links = Vec::new();
-    for (link_index, lid) in link_ids.into_iter().enumerate() {
+    for lid in link_ids {
         if let Some(node) = dom.get_node(lid) {
             // Disabled alternate sheets remain dormant until script enables
             // them. Media-gated sheets are different: they still load.
@@ -1013,7 +1030,7 @@ fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
                 continue;
             }
             if let Some(href) = node.get_attribute("href") {
-                links.push((link_index, href.to_string()));
+                links.push((lid.index() as usize, href.to_string()));
             }
         }
     }
@@ -1104,6 +1121,7 @@ impl Page {
             pending_frame_work: std::collections::VecDeque::new(),
             suspended_started_script_ids: Vec::new(),
             suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
+            suspended_console_messages: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
@@ -3183,6 +3201,16 @@ impl Page {
         body: &str,
         initial_referrer: &str,
     ) -> Result<(), PageError> {
+        // file:// is a local file read. Every client route (CLI, CDP's
+        // Page.navigate/reload/history and Target.createTarget, the MCP
+        // tools) ends up here, so the context's opt-in is enforced once
+        // instead of being copied into each handler, where a route that
+        // missed its copy read local files (#1069).
+        if url_is_file_scheme(url_str) && !self.context.allow_file_access {
+            return Err(PageError::NetworkError(format!(
+                "file:// navigation is disabled for this browser context: {url_str}"
+            )));
+        }
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
@@ -3388,17 +3416,22 @@ impl Page {
         if !author_stylesheets.is_empty() {
             if let Some(js) = &mut self.js {
                 js.with_dom(|dom| {
-                    let links = dom
-                        .query_selector_all("link[rel~=\"stylesheet\"]")
-                        .unwrap_or_default();
                     let styles = dom.query_selector_all("style").unwrap_or_default();
                     for (target, css, origin_clean, _) in &author_stylesheets {
+                        // Linked targets carry the link's node id (#1044), so
+                        // resolve it directly instead of indexing a query-order
+                        // list. InlineImport still uses the style query index.
                         let owner = match target {
-                            AuthorStylesheetTarget::Linked(index) => links.get(*index),
-                            AuthorStylesheetTarget::InlineImport(index) => styles.get(*index),
+                            AuthorStylesheetTarget::Linked(nid) => {
+                                let id = obscura_dom::NodeId::new(*nid as u32);
+                                dom.get_node(id).map(|_| id)
+                            }
+                            AuthorStylesheetTarget::InlineImport(index) => {
+                                styles.get(*index).copied()
+                            }
                         };
                         if let Some(owner) = owner {
-                            dom.append_external_stylesheet(*owner, css.clone(), *origin_clean);
+                            dom.append_external_stylesheet(owner, css.clone(), *origin_clean);
                         }
                     }
                 });
@@ -4515,6 +4548,9 @@ impl Page {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        // Preserve console messages logged before suspension: dropping the
+        // runtime below would otherwise lose any not yet drained (#971).
+        let pending_console = js.take_pending_console_messages();
         self.suspended_cdp_object_state = js.take_cdp_object_state();
         let dom = js.take_dom();
         if let Some(dom) = dom {
@@ -4530,6 +4566,7 @@ impl Page {
         // can, so they are rebuilt when the page next loads a document.
         self.pending_frame_work.clear();
         self.frames.clear();
+        self.suspended_console_messages.extend(pending_console);
         self.js = None;
     }
 
@@ -4564,6 +4601,12 @@ impl Page {
         }
     }
 
+    pub fn has_pending_navigation(&self) -> bool {
+        self.js
+            .as_ref()
+            .is_some_and(|js| js.has_pending_navigation())
+    }
+
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         if let Some(js) = &self.js {
             js.take_pending_binding_calls()
@@ -4581,10 +4624,13 @@ impl Page {
     }
 
     pub fn take_pending_console_messages(&mut self) -> Vec<String> {
-        self.js
-            .as_ref()
-            .map(ObscuraJsRuntime::take_pending_console_messages)
-            .unwrap_or_default()
+        // Buffered messages from any suspended runtime come first, then the
+        // live runtime's messages (#971).
+        let mut messages = std::mem::take(&mut self.suspended_console_messages);
+        if let Some(js) = &self.js {
+            messages.extend(js.take_pending_console_messages());
+        }
+        messages
     }
 
     pub fn set_runtime_events_enabled(&self, enabled: bool) {
@@ -4660,6 +4706,33 @@ impl Page {
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
+            // SOP gate for navigations the page queued itself (a timer or
+            // handler assigning location, a link click, a form submit). They
+            // arrive here as a fresh first URL, so the chain gate in
+            // navigate_with_wait_post_inner never sees them. A web document
+            // must not drive itself into file:// even in a context that lets
+            // clients open local files (#1069).
+            let current_url = self.url_string();
+            if cross_scheme_to_file(&current_url, &url) {
+                tracing::warn!(
+                    "blocking page-initiated cross-scheme navigation to file: {} -> {}",
+                    current_url,
+                    url,
+                );
+                // The location setter already published the target as the
+                // virtual URL; put location back on the document that is
+                // still loaded so nothing later adopts the blocked target.
+                if let Some(js) = self.js.as_mut() {
+                    let _ = js.execute_script(
+                        "<blocked-navigation>",
+                        &format!(
+                            "globalThis.__virtualUrl = {};",
+                            serde_json::to_string(&current_url).unwrap_or_else(|_| "null".into())
+                        ),
+                    );
+                }
+                return Ok(false);
+            }
             let source_url = self
                 .url
                 .as_ref()
@@ -4779,20 +4852,154 @@ mod tests {
         origin_clean: bool,
         response_url: &str,
     ) {
-        runtime
+        let link_nid = runtime
             .with_dom(|dom| {
                 let links = dom
                     .query_selector_all(r#"link[rel~="stylesheet"]"#)
                     .expect("valid selector");
-                dom.replace_external_stylesheet(links[index], css.to_string(), origin_clean)
+                let lid = links[index];
+                let _ = dom.replace_external_stylesheet(lid, css.to_string(), origin_clean);
+                lid.index() as usize
             })
             .expect("live DOM");
         runtime
             .execute_script(
                 "<linked-sheet>",
-                &register_linked_stylesheet_script(index, response_url),
+                &register_linked_stylesheet_script(link_nid, response_url),
             )
             .expect("register linked sheet");
+    }
+
+    // #1044: registration must address the <link> by its node id, not a
+    // query-order index that a load handler can shift.
+    #[test]
+    fn register_linked_stylesheet_addresses_the_node_by_nid() {
+        let mut rt = obscura_js::runtime::ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<html><body><link id="a" rel="stylesheet" href="/a.css"><link id="b" rel="stylesheet" href="/b.css"></body></html>"#,
+        ));
+        rt.set_url("http://example.com/");
+        rt.run_page_init();
+
+        // Attach load handlers to both links, then register against b's node
+        // id. The node id is not the query-order index (it counts every node
+        // before the link), so an index-based lookup (`links[b_nid]`) would
+        // miss the element entirely and fire nothing.
+        let b_nid = rt
+            .evaluate(
+                r#"(() => {
+            const a = document.getElementById('a');
+            const b = document.getElementById('b');
+            a.addEventListener('load', () => a.setAttribute('data-loaded', 'yes'));
+            b.addEventListener('load', () => b.setAttribute('data-loaded', 'yes'));
+            return b._nid;
+        })()"#,
+            )
+            .unwrap()
+            .as_f64()
+            .expect("b nid is a number") as usize;
+        assert!(
+            b_nid >= 2,
+            "node id must exceed the two-element query index for this test to be meaningful",
+        );
+
+        rt.execute_script(
+            "<linked-sheet>",
+            &register_linked_stylesheet_script(b_nid, "http://example.com/b.css"),
+        )
+        .expect("register linked sheet");
+
+        let b_loaded = rt
+            .evaluate(r#"document.getElementById('b').getAttribute('data-loaded')"#)
+            .unwrap();
+        let a_loaded = rt
+            .evaluate(r#"document.getElementById('a').getAttribute('data-loaded')"#)
+            .unwrap();
+        assert_eq!(b_loaded.as_str(), Some("yes"), "load fired on the target link");
+        assert_eq!(a_loaded.as_str(), None, "load did not fire on the other link");
+    }
+
+    fn local_html_fixture(tag: &str) -> (std::path::PathBuf, String) {
+        let path = std::env::temp_dir().join(format!(
+            "obscura-file-gate-{tag}-{}.html",
+            std::process::id()
+        ));
+        std::fs::write(&path, "<p id=secret>local-secret</p>").expect("write fixture");
+        let file_url = url::Url::from_file_path(&path).expect("file url").to_string();
+        (path, file_url)
+    }
+
+    fn file_gate_context(name: &str, allow_file_access: bool) -> std::sync::Arc<crate::BrowserContext> {
+        let mut context = crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        );
+        context.allow_file_access = allow_file_access;
+        std::sync::Arc::new(context)
+    }
+
+    // file:// is a local file read, so a browser context must opt in before any
+    // client-driven navigation reaches it. Every CLI, CDP and MCP route funnels
+    // through the one navigation entry point, so the opt-in is enforced there
+    // rather than copied into each handler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_navigation_requires_the_context_to_allow_file_access() {
+        let (path, file_url) = local_html_fixture("client");
+
+        let mut locked = super::Page::new("file-gate".to_string(), file_gate_context("file-gate", false));
+        let error = locked
+            .navigate(&file_url)
+            .await
+            .expect_err("file:// must be refused unless the context allows it")
+            .to_string();
+        assert!(error.contains("file://"), "{error}");
+        assert_ne!(locked.url_string(), file_url);
+
+        let mut open = super::Page::new("file-gate-open".to_string(), file_gate_context("file-gate-open", true));
+        open.navigate(&file_url).await.expect("an opted-in context reads local files");
+        assert_eq!(open.url_string(), file_url);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A page must never drive itself from a web origin into file://, even in a
+    // context that lets clients open local files. Timers, link clicks and form
+    // submits are consumed by process_pending_navigation as a fresh first URL,
+    // so the in-navigation chain's cross-scheme gate never sees them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_driven_navigation_cannot_cross_into_file_scheme() {
+        let (path, file_url) = local_html_fixture("page");
+        let mut page = super::Page::new("file-gate-page".to_string(), file_gate_context("file-gate-page", true));
+        page.navigate("data:text/html,<p id=web>web</p>")
+            .await
+            .expect("web page");
+        let web_url = page.url_string();
+
+        page.evaluate(&format!(
+            "location.href = {}",
+            serde_json::to_string(&file_url).expect("json string")
+        ));
+        assert!(page.has_pending_navigation(), "the page queued a navigation");
+
+        let navigated = page
+            .process_pending_navigation()
+            .await
+            .expect("a blocked page navigation is not an error");
+        assert!(!navigated);
+        assert_eq!(page.url_string(), web_url);
+        assert!(!page.has_pending_navigation(), "the blocked navigation is dropped");
+        // The location setter published the target before the block; the
+        // page must not keep reporting (or later adopt) a document it never
+        // loaded.
+        assert_eq!(page.evaluate("location.href"), serde_json::json!(web_url));
+        assert!(!page.sync_virtual_url());
+        assert_eq!(page.url_string(), web_url);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -5134,6 +5341,40 @@ mod tests {
         assert_eq!(
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
+        );
+    }
+
+    // #971: a tab switch suspends other tabs (drops their runtime). Console
+    // messages logged before suspension must be preserved, not lost.
+    #[tokio::test(flavor = "current_thread")]
+    async fn suspend_js_preserves_pending_console_messages() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "console-suspend".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("console-suspend".to_string(), context);
+        page.navigate("data:text/html,<html><body></body></html>")
+            .await
+            .unwrap();
+
+        page.set_console_messages_enabled(true);
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("console.log('important-message')")
+            .unwrap();
+
+        // Switching away suspends this tab and drops its runtime.
+        page.suspend_js();
+
+        let messages = page.take_pending_console_messages();
+        assert!(
+            messages.iter().any(|m| m.contains("important-message")),
+            "console messages logged before suspend_js must survive it, got: {messages:?}"
         );
     }
 
@@ -7636,6 +7877,12 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let seen_tx = seen_tx.clone();
                         std::thread::spawn(move || {
+                            // Accepted sockets inherit nonblocking mode on macOS.
+                            // Wait for request bytes, but bound a stalled fixture client.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                                .unwrap();
                             let mut request = [0u8; 2048];
                             let read = stream.read(&mut request).unwrap_or(0);
                             let first = String::from_utf8_lossy(&request[..read])
@@ -7935,6 +8182,12 @@ mod tests {
                         let (open, peak, seen_tx) =
                             (open_thread.clone(), peak_thread.clone(), seen_tx.clone());
                         std::thread::spawn(move || {
+                            // Accepted sockets inherit nonblocking mode on macOS.
+                            // Wait for request bytes before sending the delayed body.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                                .unwrap();
                             let now = open.fetch_add(1, Ordering::SeqCst) + 1;
                             peak.fetch_max(now, Ordering::SeqCst);
                             let mut request = [0u8; 4096];
@@ -8101,6 +8354,12 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let seen_tx = seen_tx.clone();
                         std::thread::spawn(move || {
+                            // Accepted sockets inherit nonblocking mode on macOS.
+                            // Wait for request bytes, but bound a stalled fixture client.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                                .unwrap();
                             let mut request = [0u8; 4096];
                             let read = stream.read(&mut request).unwrap_or(0);
                             let first = String::from_utf8_lossy(&request[..read])
@@ -8403,8 +8662,22 @@ mod tests {
                 "group {group} must have started loads of its own"
             );
         }
-        assert_eq!(page.prepare_screenshot_resources(8_000).await, 42);
+        page.prepare_screenshot_resources(8_000).await;
         assert!(!page.has_pending_render_resources());
+        // Earlier evaluate/queue steps may already have applied responses.
+        // The final wait returns only its own drain count, not the page total.
+        // Check every successful response across all three groups instead.
+        assert_eq!(page.network_events.len(), 42);
+        for group in 0..3 {
+            for index in 0..14 {
+                let url = format!("http://{address}/bg{group}-{index}.svg");
+                let response = page.network_events.iter()
+                    .find(|event| event.url == url)
+                    .unwrap_or_else(|| panic!("missing applied response: {url}"));
+                assert_eq!(response.status, 200, "{url}");
+                assert!(response.body_size > 0, "empty response: {url}");
+            }
+        }
         let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             peak <= obscura_js::ops::RENDER_RESOURCE_CONCURRENCY,
@@ -8911,14 +9184,21 @@ mod tests {
                <link rel="stylesheet" href="disabled.css" disabled>"#,
         );
 
-        assert_eq!(
-            linked_stylesheet_requests(&dom),
-            vec![
-                (0, "screen.css".to_string()),
-                (1, "async.css".to_string()),
-                (2, "dark.css".to_string()),
-            ]
-        );
+        let requests = linked_stylesheet_requests(&dom);
+
+        // Media-gated sheets still load; the disabled sheet is skipped. Order
+        // follows document order.
+        let hrefs: Vec<&str> = requests.iter().map(|(_, href)| href.as_str()).collect();
+        assert_eq!(hrefs, vec!["screen.css", "async.css", "dark.css"]);
+
+        // Each request carries the link's node id (#1044), so it must resolve
+        // back to that exact node, not a query-order position.
+        for (nid, href) in &requests {
+            let node = dom
+                .get_node(obscura_dom::NodeId::new(*nid as u32))
+                .expect("node id resolves to a live node");
+            assert_eq!(node.get_attribute("href"), Some(href.as_str()));
+        }
     }
 
     #[test]

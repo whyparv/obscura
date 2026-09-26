@@ -89,34 +89,43 @@ fn bearer_authorized(head: &str, expected: Option<&str>) -> bool {
     }
 }
 
-fn host_matches_bind(host_header: &str, bind_ip: std::net::IpAddr, port: u16) -> bool {
-    if bind_ip.is_unspecified() {
-        return true;
-    }
+fn host_matches_bind(
+    host_header: &str,
+    bind_ip: std::net::IpAddr,
+    port: u16,
+    forwarded: Option<(std::net::IpAddr, u16)>,
+) -> bool {
     let Ok(url) = url::Url::parse(&format!("http://{host_header}/")) else {
         return false;
     };
-    if url.port_or_known_default() != Some(port) {
-        return false;
+    fn host_matches_ip(url: &url::Url, bind_ip: std::net::IpAddr) -> bool {
+        if bind_ip.is_unspecified() {
+            return true;
+        }
+        match (url.host(), bind_ip) {
+            (Some(url::Host::Ipv4(address)), std::net::IpAddr::V4(bind)) => {
+                address == bind || (bind.is_loopback() && address.is_loopback())
+            }
+            (Some(url::Host::Ipv6(address)), std::net::IpAddr::V6(bind)) => {
+                address == bind || (bind.is_loopback() && address.is_loopback())
+            }
+            (Some(url::Host::Ipv4(address)), std::net::IpAddr::V6(bind)) => {
+                bind.is_loopback() && address.is_loopback()
+            }
+            (Some(url::Host::Ipv6(address)), std::net::IpAddr::V4(bind)) => {
+                bind.is_loopback() && address.is_loopback()
+            }
+            (Some(url::Host::Domain(domain)), _) => {
+                bind_ip.is_loopback() && domain.eq_ignore_ascii_case("localhost")
+            }
+            (None, _) => false,
+        }
     }
-    match (url.host(), bind_ip) {
-        (Some(url::Host::Ipv4(address)), std::net::IpAddr::V4(bind)) => {
-            address == bind || (bind.is_loopback() && address.is_loopback())
-        }
-        (Some(url::Host::Ipv6(address)), std::net::IpAddr::V6(bind)) => {
-            address == bind || (bind.is_loopback() && address.is_loopback())
-        }
-        (Some(url::Host::Ipv4(address)), std::net::IpAddr::V6(bind)) => {
-            bind.is_loopback() && address.is_loopback()
-        }
-        (Some(url::Host::Ipv6(address)), std::net::IpAddr::V4(bind)) => {
-            bind.is_loopback() && address.is_loopback()
-        }
-        (Some(url::Host::Domain(domain)), _) => {
-            bind_ip.is_loopback() && domain.eq_ignore_ascii_case("localhost")
-        }
-        (None, _) => false,
-    }
+    (url.port_or_known_default() == Some(port) && host_matches_ip(&url, bind_ip))
+        || forwarded.is_some_and(|(forwarded_ip, forwarded_port)| {
+            url.port_or_known_default() == Some(forwarded_port)
+                && host_matches_ip(&url, forwarded_ip)
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,12 +140,15 @@ fn control_refusal(
     head: &str,
     bind_ip: std::net::IpAddr,
     port: u16,
+    forwarded: Option<(std::net::IpAddr, u16)>,
     auth_token: Option<&str>,
 ) -> Option<ControlRefusal> {
     if header_value(head, "origin").is_some() {
         return Some(ControlRefusal::BrowserOrigin);
     }
-    if !header_value(head, "host").is_some_and(|host| host_matches_bind(host, bind_ip, port)) {
+    if !header_value(head, "host")
+        .is_some_and(|host| host_matches_bind(host, bind_ip, port, forwarded))
+    {
         return Some(ControlRefusal::ForeignHost);
     }
     if !bearer_authorized(head, auth_token) {
@@ -289,7 +301,28 @@ pub async fn start_with_serve_options_and_limit(
         .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
     let addr = SocketAddr::new(ip, port);
     let auth_token = control_token_from_env()?;
-    if !ip.is_loopback() && auth_token.is_none() {
+    let forwarded_host = std::env::var("OBSCURA_CDP_FORWARDED_HOST").ok();
+    let forwarded_port = std::env::var("OBSCURA_CDP_FORWARDED_PORT").ok();
+    let forwarded = match (forwarded_host, forwarded_port) {
+        (None, None) => None,
+        (Some(host), Some(port)) => Some((
+            host.parse::<std::net::IpAddr>().map_err(|error| {
+                anyhow::anyhow!("invalid OBSCURA_CDP_FORWARDED_HOST '{}': {}", host, error)
+            })?,
+            port.parse::<u16>().map_err(|error| {
+                anyhow::anyhow!("invalid OBSCURA_CDP_FORWARDED_PORT '{}': {}", port, error)
+            })?,
+        )),
+        _ => anyhow::bail!(
+            "OBSCURA_CDP_FORWARDED_HOST and OBSCURA_CDP_FORWARDED_PORT must be set together"
+        ),
+    };
+    if forwarded.is_some() && !ip.is_loopback() {
+        anyhow::bail!("forwarded CDP authority is only valid for loopback workers");
+    }
+    let publicly_reachable = !ip.is_loopback()
+        || forwarded.is_some_and(|(forwarded_ip, _)| !forwarded_ip.is_loopback());
+    if publicly_reachable && auth_token.is_none() {
         anyhow::bail!(
             "refusing to expose CDP without authentication; set OBSCURA_CDP_TOKEN to at least 32 bytes"
         );
@@ -414,6 +447,7 @@ pub async fn start_with_serve_options_and_limit(
                                 stream,
                                 ip,
                                 port,
+                                forwarded,
                                 accept_auth_token.as_deref(),
                                 &ws_tx,
                                 &head,
@@ -649,9 +683,9 @@ fn release_idle_connection_memory() {
     }
 }
 
-/// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
-/// runtime + `LocalSet` hosting this connection's `cdp_processor` (with its own
-/// `CdpContext` and pages) and its frame reader. Confining a connection's pages
+/// Run each connection's `cdp_processor` (with its own `CdpContext` and pages)
+/// on a dedicated `current_thread` Tokio runtime and `LocalSet`. A second thread
+/// handles WebSocket I/O independently. Confining a connection's pages
 /// to one thread is what removes the #430 abort; the interception handshake and
 /// the nav `spawn_local` all stay on this one thread, so no cross-thread V8
 /// plumbing is needed.
@@ -701,29 +735,70 @@ fn run_connection(
                     return;
                 }
             };
+            // Socket I/O must not share the renderer's LocalSet: a synchronous
+            // V8/layout task otherwise delays even replies already queued by a
+            // completed navigation. Keep all page/isolate work on this thread,
+            // and move only Send protocol strings and the socket to an I/O thread.
+            let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
+            let (io_stop_tx, io_stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let (io_done_tx, io_done_rx) = tokio::sync::oneshot::channel::<()>();
+            let io_thread = match std::thread::Builder::new()
+                .name("obscura-cdp-io".into())
+                .spawn(move || {
+                    // Dropping this sender also signals early setup failures.
+                    let _io_done = io_done_tx;
+                    let io_rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all().build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            error!("connection I/O runtime build failed: {error}");
+                            return;
+                        }
+                    };
+                    let io_local = tokio::task::LocalSet::new();
+                    io_local.block_on(&io_rt, async move {
+                        let stream = match TcpStream::from_std(std_stream) {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                error!("TcpStream::from_std failed: {error}");
+                                return;
+                            }
+                        };
+                        tokio::select! {
+                            result = handle_connection_ws(stream, msg_tx) => {
+                                if let Err(error) = result {
+                                    error!("WebSocket connection error: {error}");
+                                }
+                            }
+                            _ = io_stop_rx => {}
+                        }
+                    });
+                })
+            {
+                Ok(thread) => thread,
+                Err(error) => {
+                    error!("connection I/O thread spawn failed: {error}");
+                    return;
+                }
+            };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let tokio_stream = match TcpStream::from_std(std_stream) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("TcpStream::from_std failed: {}", e);
-                        return;
-                    }
-                };
-                let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
-                let processor = tokio::task::spawn_local(cdp_processor(
-                    msg_rx,
-                    default_context,
-                    shutdown_notify,
+                let mut processor = tokio::task::spawn_local(cdp_processor(
+                    msg_rx, default_context, shutdown_notify,
                 ));
-                if let Err(e) = handle_connection_ws(tokio_stream, msg_tx).await {
-                    error!("WebSocket connection error: {}", e);
+                tokio::select! {
+                    _ = &mut processor => {}
+                    _ = io_done_rx => {
+                        // A disconnected client must cancel an in-flight
+                        // navigation/evaluation rather than wait its deadline.
+                        processor.abort();
+                        let _ = processor.await;
+                    }
                 }
-                // Connection closed (or shutting down): stop this connection's
-                // processor so the thread can exit.
-                processor.abort();
-                let _ = processor.await;
             });
+            let _ = io_stop_tx.send(());
+            let _ = io_thread.join();
 
             // `LocalSet` owns any detached local navigation tasks, and the
             // runtime owns their scheduler allocations. Drop both before the
@@ -907,11 +982,12 @@ fn accept_dispatch(
     stream: std::net::TcpStream,
     bind_ip: std::net::IpAddr,
     port: u16,
+    forwarded: Option<(std::net::IpAddr, u16)>,
     auth_token: Option<&str>,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
     head: &str,
 ) -> anyhow::Result<()> {
-    if let Some(refusal) = control_refusal(head, bind_ip, port, auth_token) {
+    if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token) {
         refuse_control_connection(stream, refusal);
         return Ok(());
     }
@@ -2000,7 +2076,7 @@ mod tests {
     fn native_loopback_cdp_request_is_allowed() {
         let head = native_head("127.0.0.1:9222");
         assert_eq!(
-            control_refusal(&head, "127.0.0.1".parse().unwrap(), 9222, None),
+            control_refusal(&head, "127.0.0.1".parse().unwrap(), 9222, None, None),
             None
         );
     }
@@ -2012,7 +2088,13 @@ mod tests {
             "Origin: https://evil.example\r\nUpgrade: websocket",
         );
         assert_eq!(
-            control_refusal(&with_origin, "127.0.0.1".parse().unwrap(), 9222, None),
+            control_refusal(
+                &with_origin,
+                "127.0.0.1".parse().unwrap(),
+                9222,
+                None,
+                None,
+            ),
             Some(ControlRefusal::BrowserOrigin)
         );
         assert_eq!(
@@ -2021,8 +2103,44 @@ mod tests {
                 "127.0.0.1".parse().unwrap(),
                 9222,
                 None,
+                None,
             ),
             Some(ControlRefusal::ForeignHost)
+        );
+    }
+
+    #[test]
+    fn loopback_worker_accepts_only_its_forwarded_public_port() {
+        let bind = "127.0.0.1".parse().unwrap();
+        let forwarded = Some((bind, 9222));
+        assert_eq!(
+            control_refusal(&native_head("127.0.0.1:9222"), bind, 9223, forwarded, None),
+            None
+        );
+        assert_eq!(
+            control_refusal(
+                &native_head("rebind.example:9222"),
+                bind,
+                9223,
+                forwarded,
+                None,
+            ),
+            Some(ControlRefusal::ForeignHost)
+        );
+        assert_eq!(
+            control_refusal(&native_head("127.0.0.1:9444"), bind, 9223, forwarded, None),
+            Some(ControlRefusal::ForeignHost)
+        );
+    }
+
+    #[test]
+    fn public_worker_authority_still_requires_authentication() {
+        let bind = "127.0.0.1".parse().unwrap();
+        let public = Some(("0.0.0.0".parse().unwrap(), 9222));
+        let head = native_head("cdp.example.test:9222");
+        assert_eq!(
+            control_refusal(&head, bind, 9223, public, Some("secret")),
+            Some(ControlRefusal::Unauthorized)
         );
     }
 
@@ -2048,6 +2166,63 @@ mod tests {
 
         let malformed = "GET /json/version HTTP/1.1\r\nHost: attacker.test/path\r\n\r\n";
         assert_eq!(websocket_authority(malformed, 9223), "127.0.0.1:9223");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_replies_are_not_blocked_by_renderer_tasks() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::time::{Duration, Instant};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(1));
+        let live_server = live.clone();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let context = crate::dispatch::CdpContext::new().default_context;
+            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
+        accept.await.unwrap();
+        ws.send(Message::Text(json!({"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}).to_string().into())).await.unwrap();
+        let mut session = None;
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = msg {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if let Some(sid) = value["params"]["sessionId"].as_str() { session = Some(sid.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+        }
+        let started = Instant::now();
+        ws.send(Message::Text(json!({"id":2,"method":"Runtime.evaluate","sessionId":session.as_ref().unwrap(),
+            "params":{"expression":"setTimeout(() => { const end=Date.now()+600; while(Date.now()<end){} },0); { const end=Date.now()+30; while(Date.now()<end){} }; 'armed'","returnByValue":true}}).to_string().into())).await.unwrap();
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = msg {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["id"] == 2 {
+                    assert!(value.get("error").is_none(), "{value}");
+                    break;
+                }
+            }
+        }
+        assert!(started.elapsed() < Duration::from_millis(300),
+            "a completed reply was trapped behind unrelated renderer work: {:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        ws.send(Message::Text(json!({"id":3,"method":"Runtime.evaluate","sessionId":session.as_ref().unwrap(),
+            "params":{"expression":"new Promise(() => {})","awaitPromise":true}}).to_string().into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        ws.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("connection and I/O threads must stop on socket close");
     }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
@@ -2174,6 +2349,138 @@ mod tests {
                     .unwrap();
                     if value["id"] == 3 {
                         assert_eq!(value["result"]["result"]["value"], "yes");
+                        break;
+                    }
+                }
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn click_navigation_acknowledges_input_before_navigation_events() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                reply_rx.recv().await.expect("processor init");
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Target.createTarget",
+                    "params": {"url": "about:blank"},
+                }));
+
+                let mut session_id = None;
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("create target timeout")
+                            .expect("create target response"),
+                    )
+                    .unwrap();
+                    if session_id.is_none() {
+                        session_id = value["params"]["sessionId"].as_str().map(str::to_string);
+                    }
+                    if value["id"] == 1 {
+                        break;
+                    }
+                }
+                let session_id = session_id.expect("attached page session");
+
+                send(json!({
+                    "id": 2,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {"expression": "document.body.innerHTML='<a id=route href=\"data:text/html,navigated\">go</a>';document.elementFromPoint=()=>route"},
+                }));
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("setup timeout")
+                            .expect("setup response"),
+                    )
+                    .unwrap();
+                    if value["id"] == 2 {
+                        break;
+                    }
+                }
+
+                for (id, event_type) in [(3, "mousePressed"), (4, "mouseReleased")] {
+                    send(json!({
+                        "id": id,
+                        "method": "Input.dispatchMouseEvent",
+                        "sessionId": session_id,
+                        "params": {"type": event_type, "x": 0, "y": 0, "button": "left"},
+                    }));
+                    if id == 3 {
+                        loop {
+                            let value: serde_json::Value = serde_json::from_str(
+                                &tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    reply_rx.recv(),
+                                )
+                                .await
+                                .expect("mouse press timeout")
+                                .expect("mouse press response"),
+                            )
+                            .unwrap();
+                            if value["id"] == 3 {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let mut input_acknowledged = false;
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("click navigation timeout")
+                            .expect("click navigation response"),
+                    )
+                    .unwrap();
+                    if value["id"] == 4 {
+                        input_acknowledged = true;
+                    }
+                    if value["method"] == "Page.frameNavigated"
+                        && value["params"]["frame"]["url"]
+                            .as_str()
+                            .is_some_and(|url| url.starts_with("data:text/html,navigated"))
+                    {
+                        assert!(
+                            input_acknowledged,
+                            "Input.dispatchMouseEvent must be acknowledged before click navigation events"
+                        );
                         break;
                     }
                 }
