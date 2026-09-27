@@ -1934,7 +1934,7 @@ fn fast_path_response(text: &str) -> Option<String> {
 
     let result = match req.method.as_str() {
         "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
-        "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
+        "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
         "Emulation.setTouchEmulationEnabled" |
@@ -2065,6 +2065,20 @@ mod tests {
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn lifecycle_subscription_commands_reach_the_stateful_dispatcher() {
+        for enabled in [true, false] {
+            let request = json!({
+                "id": 1,
+                "method": "Page.setLifecycleEventsEnabled",
+                "params": {"enabled": enabled},
+                "sessionId": "page-session",
+            });
+            assert!(super::fast_path_response(&request.to_string()).is_none(),
+                "lifecycle subscriptions must not be acknowledged without updating state");
+        }
+    }
 
     fn native_head(host: &str) -> String {
         format!(
