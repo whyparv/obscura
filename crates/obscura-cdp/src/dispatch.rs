@@ -84,6 +84,8 @@ pub struct CdpContext {
     /// Sessions that called Runtime.enable. Console and exception events are
     /// page-scoped but only delivered to these subscribers.
     pub runtime_enabled_sessions: HashSet<String>,
+    /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
+    pub(crate) lifecycle_enabled_sessions: HashSet<String>,
     // Legacy direct-embedder configuration. Protocol-created worlds live only
     // in `page_isolated_worlds`, so this vector does not grow with page churn.
     pub isolated_worlds: Vec<String>,
@@ -188,6 +190,7 @@ impl CdpContext {
             preload_scripts: Vec::new(),
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
+            lifecycle_enabled_sessions: HashSet::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -345,6 +348,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
+            self.lifecycle_enabled_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -865,7 +869,7 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
     }
 
     let mut page_to_sessions: HashMap<&str, Vec<&str>> = HashMap::new();
-    for session_id in &ctx.runtime_enabled_sessions {
+    for session_id in ctx.runtime_enabled_sessions.union(&ctx.lifecycle_enabled_sessions) {
         if let Some(page_id) = ctx.sessions.get(session_id) {
             page_to_sessions
                 .entry(page_id.as_str())
@@ -883,8 +887,25 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
         };
         let execution_context_id = ctx.default_context_id(&page_id).unwrap_or(1);
         for runtime_event in runtime_events {
+            let subscribers = if matches!(&runtime_event, obscura_js::ops::RuntimeEvent::DocumentLifecycle { .. }) {
+                &ctx.lifecycle_enabled_sessions
+            } else {
+                &ctx.runtime_enabled_sessions
+            };
             for session_id in sessions {
+                if !subscribers.contains(*session_id) {
+                    continue;
+                }
                 let (method, params) = match &runtime_event {
+                    obscura_js::ops::RuntimeEvent::DocumentLifecycle { name, timestamp } => (
+                        "Page.lifecycleEvent",
+                        json!({
+                            "frameId": ctx.pages.iter().find(|page| page.id == page_id).map(|page| &page.frame_id),
+                            "loaderId": ctx.current_loader_ids.get(&page_id),
+                            "name": name,
+                            "timestamp": timestamp,
+                        }),
+                    ),
                     obscura_js::ops::RuntimeEvent::Console(event) => (
                         "Runtime.consoleAPICalled",
                         json!({
