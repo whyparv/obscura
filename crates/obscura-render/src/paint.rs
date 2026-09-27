@@ -793,7 +793,10 @@ pub enum CaptureError {
     EncodeFailed,
 }
 
-fn checked_capture_dimensions(region: CaptureRegion) -> Result<(u32, u32, u32, u32), CaptureError> {
+fn checked_capture_dimensions(
+    region: CaptureRegion,
+    allocates_native_surface: bool,
+) -> Result<(u32, u32, u32, u32), CaptureError> {
     if !region.x.is_finite()
         || !region.y.is_finite()
         || !region.width.is_finite()
@@ -838,14 +841,21 @@ fn checked_capture_dimensions(region: CaptureRegion) -> Result<(u32, u32, u32, u
         output_width as u32,
         output_height as u32,
     );
-    for (width, height) in [(dimensions.0, dimensions.1), (dimensions.2, dimensions.3)] {
+    let checked_surfaces = if allocates_native_surface {
+        &[(dimensions.0, dimensions.1), (dimensions.2, dimensions.3)][..]
+    } else {
+        &[(dimensions.2, dimensions.3)][..]
+    };
+    for &(width, height) in checked_surfaces {
         if u64::from(width).saturating_mul(u64::from(height)) > MAX_CAPTURE_PIXELS {
             return Err(CaptureError::AllocationLimitExceeded);
         }
     }
     let native_pixels = u64::from(dimensions.0).saturating_mul(u64::from(dimensions.1));
     let output_pixels = u64::from(dimensions.2).saturating_mul(u64::from(dimensions.3));
-    let peak_pixels = if dimensions.0 == dimensions.2 && dimensions.1 == dimensions.3 {
+    let peak_pixels = if !allocates_native_surface {
+        output_pixels
+    } else if dimensions.0 == dimensions.2 && dimensions.1 == dimensions.3 {
         native_pixels
     } else {
         // Scaling owns the native RGBA surface and output RGBA surface at the
@@ -862,7 +872,7 @@ fn checked_capture_dimensions(region: CaptureRegion) -> Result<(u32, u32, u32, u
 /// Protocol adapters use this on legacy viewport captures which preserve the
 /// renderer's native PNG bytes but must obey the same limits as region capture.
 pub fn validate_capture_region(region: CaptureRegion) -> Result<(), CaptureError> {
-    checked_capture_dimensions(region).map(|_| ())
+    checked_capture_dimensions(region, true).map(|_| ())
 }
 
 impl ResolvedScrollState {
@@ -1428,7 +1438,7 @@ impl PreparedRender {
             width: 0.001,
             height: 0.001,
         };
-        let mut best: Option<(Vec<i32>, usize, usize, obscura_dom::tree::NodeId)> = None;
+        let mut best: Option<(Vec<i32>, bool, usize, usize, obscura_dom::tree::NodeId)> = None;
         for (order, id) in crate::dom::rendered_descendants(tree, tree.document())
             .into_iter()
             .enumerate()
@@ -1456,20 +1466,32 @@ impl PreparedRender {
                 continue;
             }
             let path = stacking_path(tree, &self.layout, id);
+            let positioned = style.position.is_some() || style.position_fixed || style.position_sticky;
             let depth = tree.ancestors(id).len();
             let replace = best
                 .as_ref()
-                .is_none_or(|(best_path, best_depth, best_order, _)| {
-                    compare_stacking_paths(&path, best_path)
+                .is_none_or(|(best_path, best_positioned, best_depth, best_order, best_id)| {
+                    let stacking = compare_stacking_paths(&path, best_path);
+                    if stacking != std::cmp::Ordering::Equal {
+                        return stacking.is_gt();
+                    }
+                    if tree.ancestors(id).contains(best_id) {
+                        return true;
+                    }
+                    if tree.ancestors(*best_id).contains(&id) {
+                        return false;
+                    }
+                    positioned
+                        .cmp(best_positioned)
                         .then_with(|| depth.cmp(best_depth))
                         .then_with(|| order.cmp(best_order))
                         .is_gt()
                 });
             if replace {
-                best = Some((path, depth, order, id));
+                best = Some((path, positioned, depth, order, id));
             }
         }
-        best.map(|(_, _, _, id)| id)
+        best.map(|(_, _, _, _, id)| id)
     }
 
     /// A compact CSSOM snapshot derived from the same final cascade and
@@ -1482,119 +1504,7 @@ impl PreparedRender {
     ) -> Option<HashMap<&'static str, String>> {
         let style = self.layout.styles.get(&id)?;
         let rect = self.layout.rects.get(&id);
-        let mut out = HashMap::new();
-
-        let active_webkit_clamp = style.webkit_box_display.is_some()
-            && style.webkit_box_orient_vertical
-            && style.webkit_line_clamp.is_some();
-        let display = if style.display_contents {
-            "contents"
-        } else if style.display == crate::Display::None {
-            "none"
-        } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
-            "flow-root"
-        } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
-            "-webkit-box"
-        } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
-            "-webkit-inline-box"
-        } else if style.internal_flex_container {
-            "block"
-        } else {
-            match (style.display, style.is_inline_block) {
-                (crate::Display::Flex, true) => "inline-flex",
-                (crate::Display::Grid, true) => "inline-grid",
-                (crate::Display::Block, true) => "inline-block",
-                (crate::Display::Flex, false) => "flex",
-                (crate::Display::Grid, false) => "grid",
-                (crate::Display::Inline, true) => "inline-block",
-                (crate::Display::Inline, false) => "inline",
-                _ => "block",
-            }
-        };
-        out.insert("display", display.to_string());
-        out.insert(
-            "float",
-            match style.float {
-                Some(crate::Float::Left) => "left",
-                Some(crate::Float::Right) => "right",
-                None => "none",
-            }
-            .to_string(),
-        );
-        out.insert(
-            "clear",
-            match style.clear {
-                Some(crate::Clear::Left) => "left",
-                Some(crate::Clear::Right) => "right",
-                Some(crate::Clear::Both) => "both",
-                None => "none",
-            }
-            .to_string(),
-        );
-        out.insert(
-            "position",
-            if style.position_fixed {
-                "fixed"
-            } else if style.position_sticky {
-                "sticky"
-            } else {
-                match style.position {
-                    Some(taffy::Position::Absolute) => "absolute",
-                    Some(taffy::Position::Relative) => "relative",
-                    _ => "static",
-                }
-            }
-            .to_string(),
-        );
-        out.insert(
-            "z-index",
-            style
-                .z_index
-                .map_or_else(|| "auto".to_string(), |v| v.to_string()),
-        );
-        out.insert(
-            "visibility",
-            if style.visibility_hidden.unwrap_or(false) {
-                "hidden"
-            } else {
-                "visible"
-            }
-            .to_string(),
-        );
-        out.insert(
-            "pointer-events",
-            if style.pointer_events_none.unwrap_or(false) {
-                "none"
-            } else {
-                "auto"
-            }
-            .to_string(),
-        );
-        out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
-        out.insert(
-            "background-color",
-            css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
-        );
-        out.insert(
-            "background-origin",
-            match style.background_origin {
-                crate::BackgroundOrigin::BorderBox => "border-box",
-                crate::BackgroundOrigin::PaddingBox => "padding-box",
-                crate::BackgroundOrigin::ContentBox => "content-box",
-            }
-            .to_string(),
-        );
-        out.insert(
-            "background-clip",
-            match style.background_clip {
-                crate::BackgroundClip::BorderBox => "border-box",
-                crate::BackgroundClip::PaddingBox => "padding-box",
-                crate::BackgroundClip::ContentBox => "content-box",
-                crate::BackgroundClip::Text => "text",
-            }
-            .to_string(),
-        );
-        out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
+        let mut out = non_geometric_computed_style(style);
         out.insert("font-size", css_px(style.font_size.unwrap_or(16.0)));
         out.insert(
             "font-weight",
@@ -1896,6 +1806,23 @@ impl PreparedRender {
         Some(out)
     }
 
+    pub fn computed_pseudo_content(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        before: bool,
+    ) -> Option<(Option<&str>, &'static str)> {
+        let style = self.layout.styles.get(&id)?;
+        let pseudo = if before {
+            style.before_pseudo.as_deref()
+        } else {
+            style.after_pseudo.as_deref()
+        };
+        Some((
+            pseudo.and_then(|style| style.before_content.as_deref()),
+            pseudo.map_or("none", computed_display),
+        ))
+    }
+
     /// Cascaded custom properties exposed by CSSOM alongside the compact
     /// fixed-property snapshot above. These maps are shared across unchanged
     /// inherited subtrees by `DomLayout`, so reading one does not require a
@@ -2086,6 +2013,125 @@ impl PreparedRender {
             }
             false
         })
+    }
+}
+
+pub(crate) fn non_geometric_computed_style(style: &crate::LayoutStyle) -> HashMap<&'static str, String> {
+    let mut out = HashMap::new();
+
+    out.insert("display", computed_display(style).to_string());
+    out.insert(
+        "float",
+        match style.float {
+            Some(crate::Float::Left) => "left",
+            Some(crate::Float::Right) => "right",
+            None => "none",
+        }
+        .to_string(),
+    );
+    out.insert(
+        "clear",
+        match style.clear {
+            Some(crate::Clear::Left) => "left",
+            Some(crate::Clear::Right) => "right",
+            Some(crate::Clear::Both) => "both",
+            None => "none",
+        }
+        .to_string(),
+    );
+    out.insert(
+        "position",
+        if style.position_fixed {
+            "fixed"
+        } else if style.position_sticky {
+            "sticky"
+        } else {
+            match style.position {
+                Some(taffy::Position::Absolute) => "absolute",
+                Some(taffy::Position::Relative) => "relative",
+                _ => "static",
+            }
+        }
+        .to_string(),
+    );
+    out.insert(
+        "z-index",
+        style
+            .z_index
+            .map_or_else(|| "auto".to_string(), |v| v.to_string()),
+    );
+    out.insert(
+        "visibility",
+        if style.visibility_hidden.unwrap_or(false) {
+            "hidden"
+        } else {
+            "visible"
+        }
+        .to_string(),
+    );
+    out.insert(
+        "pointer-events",
+        if style.pointer_events_none.unwrap_or(false) {
+            "none"
+        } else {
+            "auto"
+        }
+        .to_string(),
+    );
+    out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
+    out.insert(
+        "background-color",
+        css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
+    );
+    out.insert(
+        "background-origin",
+        match style.background_origin {
+            crate::BackgroundOrigin::BorderBox => "border-box",
+            crate::BackgroundOrigin::PaddingBox => "padding-box",
+            crate::BackgroundOrigin::ContentBox => "content-box",
+        }
+        .to_string(),
+    );
+    out.insert(
+        "background-clip",
+        match style.background_clip {
+            crate::BackgroundClip::BorderBox => "border-box",
+            crate::BackgroundClip::PaddingBox => "padding-box",
+            crate::BackgroundClip::ContentBox => "content-box",
+            crate::BackgroundClip::Text => "text",
+        }
+        .to_string(),
+    );
+    out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
+    out
+}
+
+fn computed_display(style: &crate::LayoutStyle) -> &'static str {
+    let active_webkit_clamp = style.webkit_box_display.is_some()
+        && style.webkit_box_orient_vertical
+        && style.webkit_line_clamp.is_some();
+    if style.display_contents {
+        "contents"
+    } else if style.display == crate::Display::None {
+        "none"
+    } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
+        "flow-root"
+    } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
+        "-webkit-box"
+    } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
+        "-webkit-inline-box"
+    } else if style.internal_flex_container {
+        "block"
+    } else {
+        match (style.display, style.is_inline_block) {
+            (crate::Display::Flex, true) => "inline-flex",
+            (crate::Display::Grid, true) => "inline-grid",
+            (crate::Display::Block | crate::Display::Inline, true) => "inline-block",
+            (crate::Display::Flex, false) => "flex",
+            (crate::Display::Grid, false) => "grid",
+            (crate::Display::Inline, false) => "inline",
+            _ => "block",
+        }
     }
 }
 
@@ -3081,7 +3127,7 @@ fn paint_prepared_region_with_scroll_policy(
     canvas_surfaces: &dyn CanvasSurfaceSource,
 ) -> Result<Pixmap, CaptureError> {
     let (native_width, native_height, output_width, output_height) =
-        checked_capture_dimensions(region)?;
+        checked_capture_dimensions(region, false)?;
     let scale_matches_output =
         (output_width as f64 - f64::from(region.width) * f64::from(region.scale)).abs() <= 1.0
             && (output_height as f64 - f64::from(region.height) * f64::from(region.scale)).abs()
@@ -3089,6 +3135,9 @@ fn paint_prepared_region_with_scroll_policy(
     let native_scaled = (output_width != native_width || output_height != native_height)
         && scale_matches_output
         && native_raster_scale_supported(tree, &prepared.layout);
+    if !native_scaled {
+        checked_capture_dimensions(region, true)?;
+    }
     let (paint_width, paint_height, raster_scale) = if native_scaled {
         (output_width, output_height, region.scale)
     } else {
@@ -12030,6 +12079,66 @@ mod tests {
         assert_eq!(display("#authored-inline"), "inline");
         assert_eq!(display("#authored-block"), "block");
         assert_eq!(display("#authored-inline-block"), "inline-block");
+    }
+
+    #[test]
+    fn ancestor_cssom_matches_full_layout_and_rejects_geometry_dependencies() {
+        let tree = parse_html(r#"<!doctype html><style>
+            body { --tone:blue; color:var(--tone); pointer-events:none }
+            body[data-active=yes] { --tone:red }
+            #flex { display:flex }
+            #contents { display:contents }
+            #item { display:inline-flex; background-color:green; opacity:.4 }
+            #float { float:left; display:inline; position:relative; z-index:3 }
+            #inherit { display:inherit }
+            #animated { animation:fade 1s infinite }
+            @keyframes fade { to { opacity:0 } }
+            #container { container-type:inline-size }
+            @container (min-width:1px) { #query { color:green } }
+        </style><body>
+            <div id=flex><div id=contents><span id=item>label</span></div></div>
+            <span id=float>floating</span><div id=inherit>inherited</div>
+            <input id=hidden type=" HIDDEN "><div id=animated>animated</div>
+            <div id=container><span id=query>query</span></div>
+        </body>"#);
+        let viewport = (400.0, 200.0);
+        let mut cache = crate::StylesheetCache::default();
+        let mut resources = RenderResourceCache::default();
+        prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, viewport, None, &mut resources, &[], &mut cache,
+        ).unwrap();
+        let body = tree.query_selector("body").unwrap().unwrap();
+        for active in ["yes", "no"] {
+            tree.with_node_mut(body, |node| node.set_attribute("data-active", active.into()));
+            let full = prepare_dom(&tree, viewport, None, &mut resources).unwrap();
+            for name in ["flex", "contents", "item", "float"] {
+                let id = tree.get_element_by_id(name).unwrap();
+                let fast = crate::dom::computed_style_without_layout(
+                    &tree, id, viewport, crate::CssMediaType::Screen, &cache, "color",
+                ).expect("ordinary ancestors need no layout");
+                let expected = full.computed_style(id).unwrap();
+                for (property, value) in fast {
+                    assert_eq!(value, expected[property], "{name}.{property} with {active}");
+                }
+            }
+            for name in ["inherit", "hidden", "animated", "query"] {
+                assert!(crate::dom::computed_style_without_layout(
+                    &tree, tree.get_element_by_id(name).unwrap(), viewport,
+                    crate::CssMediaType::Screen, &cache, "display",
+                ).is_none(), "{name} must use full normalization");
+            }
+        }
+        let item = tree.get_element_by_id("item").unwrap();
+        assert!(crate::dom::computed_style_without_layout(
+            &tree, item, viewport, crate::CssMediaType::Screen, &cache, "width",
+        ).is_none());
+        let source_bytes = cache.retained_source_bytes();
+        let style = tree.query_selector("style").unwrap().unwrap();
+        tree.append_text(style, "#item { color:purple }");
+        assert!(crate::dom::computed_style_without_layout(
+            &tree, item, viewport, crate::CssMediaType::Screen, &cache, "color",
+        ).is_none(), "stylesheet changes must invalidate retained styles through the normal path");
+        assert_eq!(cache.retained_source_bytes(), source_bytes);
     }
 
     #[test]

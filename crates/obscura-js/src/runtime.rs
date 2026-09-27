@@ -56,6 +56,54 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 /// serializing it costs nothing measurable; isolate *execution* stays fully
 /// parallel, each isolate on its own thread with no shared lock.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static NEXT_CDP_OBJECT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+#[cfg(test)]
+static CLASSIC_CODE_CACHE_ACCEPTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct ClassicCodeCacheEntry {
+    origin: String,
+    name: String,
+    source: String,
+    data: std::sync::Arc<[u8]>,
+}
+
+impl ClassicCodeCacheEntry {
+    fn bytes(&self) -> usize {
+        self.origin.len() + self.name.len() + self.source.len() + self.data.len()
+    }
+}
+
+const CLASSIC_CODE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+// ponytail: bounded FIFO; only add LRU bookkeeping if eviction profiles justify it.
+static CLASSIC_CODE_CACHE: std::sync::Mutex<std::collections::VecDeque<ClassicCodeCacheEntry>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn cached_classic_code(origin: &str, name: &str, source: &str) -> Option<std::sync::Arc<[u8]>> {
+    let cache = CLASSIC_CODE_CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    cache.iter().rev().find(|entry| {
+        entry.origin == origin && entry.name == name && entry.source == source
+    }).map(|entry| entry.data.clone())
+}
+
+fn remember_classic_code(origin: &str, name: &str, source: &str, data: &[u8]) {
+    let bytes = origin.len() + name.len() + source.len() + data.len();
+    if bytes > CLASSIC_CODE_CACHE_BYTES {
+        return;
+    }
+    let mut cache = CLASSIC_CODE_CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    cache.retain(|entry| entry.origin != origin || entry.name != name);
+    let mut used = cache.iter().map(ClassicCodeCacheEntry::bytes).sum::<usize>();
+    while used + bytes > CLASSIC_CODE_CACHE_BYTES || cache.len() >= 64 {
+        let Some(old) = cache.pop_front() else { break };
+        used -= old.bytes();
+    }
+    cache.push_back(ClassicCodeCacheEntry {
+        origin: origin.to_string(), name: name.to_string(), source: source.to_string(),
+        data: std::sync::Arc::from(data),
+    });
+}
 
 /// Enter a tokio runtime context when the caller is not already in one.
 ///
@@ -179,6 +227,7 @@ pub struct RemoteObjectInfo {
     pub description: String,
     pub object_id: Option<String>,
     pub value: Option<serde_json::Value>,
+    pub unserializable_value: Option<String>,
 }
 
 /// CDP remote objects that can be rebuilt when a page's V8 runtime is
@@ -278,12 +327,10 @@ fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
 }
 
 /// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
-/// Holds the cancel channel and the watchdog thread; pass it back to
+/// Holds a deadline on the shared watchdog; pass it back to
 /// `disarm_watchdog` to stop the watchdog and learn whether it fired.
 pub struct WatchdogToken {
-    pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-    join: Option<std::thread::JoinHandle<()>>,
-    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    armed: Option<crate::cdp_watchdog::Armed>,
 }
 
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
@@ -292,73 +339,28 @@ pub struct WatchdogToken {
 /// [`WatchdogToken::stop`]; if `stop` returns true, clear the termination flag
 /// via [`ObscuraJsRuntime::cancel_termination`] before reusing the isolate.
 pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> WatchdogToken {
-    let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let pair_c = pair.clone();
-    let fired_c = fired.clone();
-    let join = std::thread::spawn(move || {
-        let (lock, cvar) = &*pair_c;
-        let mut cancelled = lock.lock().unwrap();
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            // Check first: stop() may have set this (and notified into the void)
-            // before this thread even started, which happens constantly for fast
-            // CDP commands where stop() is called right after spawn. Without this
-            // top check the lost notify means we wait the full budget before
-            // noticing, and stop()'s join() blocks for that whole time.
-            if *cancelled {
-                return;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                fired_c.store(true, std::sync::atomic::Ordering::SeqCst);
-                handle.terminate_execution();
-                return;
-            }
-            let (guard, _) = cvar.wait_timeout(cancelled, remaining).unwrap();
-            cancelled = guard;
-            if *cancelled {
-                return;
-            }
-        }
-    });
     WatchdogToken {
-        pair,
-        join: Some(join),
-        fired,
+        armed: Some(crate::cdp_watchdog::arm(handle, budget)),
     }
 }
 
 impl WatchdogToken {
-    fn cancel_and_join(&mut self) {
-        if self.join.is_none() {
-            return;
-        }
-        {
-            let (lock, cvar) = &*self.pair;
-            *lock.lock().unwrap() = true;
-            cvar.notify_one();
-        }
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
-
     /// Stop the watchdog. Returns true if it had already fired (terminated the
     /// isolate). The caller must then clear the termination flag via
     /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
     pub fn stop(mut self) -> bool {
-        self.cancel_and_join();
-        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+        self.armed.take().map(crate::cdp_watchdog::disarm).unwrap_or(false)
     }
 }
 
 impl Drop for WatchdogToken {
     fn drop(&mut self) {
         // Futures which own a watchdog may be cancelled while parked on I/O.
-        // Dropping the token must not leave a detached thread which later
+        // Dropping the token must not leave an armed deadline which later
         // terminates an isolate that has already moved on to another task.
-        self.cancel_and_join();
+        if let Some(armed) = self.armed.take() {
+            crate::cdp_watchdog::disarm(armed);
+        }
     }
 }
 
@@ -1408,6 +1410,10 @@ impl ObscuraJsRuntime {
         state.intercept_enabled = enabled;
     }
 
+    pub fn set_intercept_page_id(&self, page_id: &str) {
+        self.state.borrow_mut().intercept_page_id = page_id.to_string();
+    }
+
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
     /// loads honour them like the page's own subresource fetches do.
     #[cfg(feature = "render")]
@@ -1419,6 +1425,16 @@ impl ObscuraJsRuntime {
         let _ = self.execute_runtime_script(
             "<set-ua>",
             format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
+        );
+    }
+
+    pub fn set_locale(&mut self, locale: &str) {
+        let _ = self.execute_runtime_script(
+            "<set-locale>",
+            format!(
+                "globalThis.__obscura_language = {};",
+                js_string_literal(locale)
+            ),
         );
     }
 
@@ -1696,6 +1712,36 @@ impl ObscuraJsRuntime {
         region: obscura_render::CaptureRegion,
         surface_color: [u8; 4],
     ) -> Result<Vec<u8>, obscura_render::CaptureError> {
+        self.paint_prepared_region_with_surface_color(region, surface_color)?
+            .encode_png()
+            .map_err(|_| obscura_render::CaptureError::EncodeFailed)
+    }
+
+    #[cfg(feature = "render")]
+    pub fn screenshot_prepared_region_raster_with_surface_color(
+        &self,
+        region: obscura_render::CaptureRegion,
+        surface_color: [u8; 4],
+    ) -> Result<(u32, u32, Vec<u8>), obscura_render::CaptureError> {
+        let raster = self.paint_prepared_region_with_surface_color(region, surface_color)?;
+        let (width, height) = (raster.width(), raster.height());
+        // Opaque frames already contain straight RGBA. Avoid rewriting every
+        // pixel, but inspect the final surface so transparent captures retain
+        // the renderer's exact demultiplication and rounding behavior.
+        let pixels = if raster.pixels().iter().all(|pixel| pixel.is_opaque()) {
+            raster.take()
+        } else {
+            raster.take_demultiplied()
+        };
+        Ok((width, height, pixels))
+    }
+
+    #[cfg(feature = "render")]
+    fn paint_prepared_region_with_surface_color(
+        &self,
+        region: obscura_render::CaptureRegion,
+        surface_color: [u8; 4],
+    ) -> Result<obscura_render::Pixmap, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
@@ -1711,7 +1757,7 @@ impl ObscuraJsRuntime {
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
             let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+            obscura_render::paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
                 prepared_render
@@ -1973,19 +2019,13 @@ impl ObscuraJsRuntime {
         let misses = state.render_resources.take_sync_misses();
         let mut requests = Vec::new();
         for (url, profile, is_font) in misses {
-            // Same policy as `Page::should_block_url`: `Network.setBlockedURLs`
-            // patterns, and while `Fetch.enable` is active also its patterns
-            // (an intercepted subresource is not fetched behind the client's
-            // back). The matcher is the page's CDP pattern matcher.
+            // Fetch interception patterns pause requests; they are not a URL
+            // blocklist. Static renderer resources currently pass through,
+            // while Network.setBlockedURLs remains authoritative here.
             let blocked = state
                 .blocked_urls
                 .iter()
-                .any(|pattern| crate::ops::glob_match(pattern, &url))
-                || (state.intercept_enabled
-                    && state
-                        .intercept_block_patterns
-                        .iter()
-                        .any(|pattern| crate::ops::glob_match(pattern, &url)));
+                .any(|pattern| crate::ops::glob_match(pattern, &url));
             let allowed = page_render_resource_url_allowed(&state.url, &url);
             if blocked || !allowed {
                 match profile {
@@ -2480,7 +2520,7 @@ impl ObscuraJsRuntime {
 
         let meta_str = if await_promise {
             let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true && delete globalThis.__obscura_done_{done_counter}");
             let settled = self
                 .resolve_promises_until(
                     |rt| {
@@ -2533,34 +2573,21 @@ impl ObscuraJsRuntime {
         if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
             return self.thrown_info(&oid);
         }
+        if return_by_value {
+            return self.take_cdp_result_by_value(&oid);
+        }
         let meta_str = self.v8_to_json(meta_str)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str)
         } else {
             meta_str
         };
-        self.object_store.insert(
-            oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
-        );
-        if !return_by_value {
-            // The eval-based wrapper above parses the raw expression as
-            // statements, so no trailing-semicolon trim is needed here.
-            self.evaluation_recipes
-                .insert(oid.clone(), expression.to_string());
+        let info = self.finish_cdp_result(&meta_json, &oid)?;
+        // The eval-based wrapper parses the expression as statements.
+        if info.object_id.is_some() {
+            self.evaluation_recipes.insert(oid, expression.to_string());
         }
-
-        if return_by_value {
-            let read = self
-                .execute_runtime_script(
-                    "<readResult>",
-                    format!("globalThis.__obscura_objects['{}']", oid),
-                )
-                .map_err(|e| format!("JS error: {}", e))?;
-            return self.v8_to_cdp_value(read);
-        }
-
-        Ok(Self::info_from_meta(&meta_json, Some(oid)))
+        Ok(info)
     }
 
     pub async fn call_function_on_for_cdp(
@@ -2635,7 +2662,7 @@ impl ObscuraJsRuntime {
                 .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true && delete globalThis.__obscura_done_{done_counter}");
             let settled = self
                 .resolve_promises_until(
                     |rt| {
@@ -2684,13 +2711,7 @@ impl ObscuraJsRuntime {
             }
 
             if return_by_value {
-                let read = self
-                    .execute_runtime_script(
-                        "<readResult>",
-                        format!("globalThis.__obscura_objects['{}']", oid),
-                    )
-                    .map_err(|e| format!("JS error: {}", e))?;
-                return self.v8_to_cdp_value(read);
+                return self.take_cdp_result_by_value(&oid);
             }
 
             let meta_result = self
@@ -2702,11 +2723,7 @@ impl ObscuraJsRuntime {
             } else {
                 meta_str
             };
-            self.object_store.insert(
-                oid.clone(),
-                format!("globalThis.__obscura_objects['{}']", oid),
-            );
-            return Ok(Self::info_from_meta(&meta_json, Some(oid)));
+            return self.finish_cdp_result(&meta_json, &oid);
         }
 
         if return_by_value {
@@ -2753,11 +2770,7 @@ impl ObscuraJsRuntime {
         } else {
             meta_str
         };
-        self.object_store.insert(
-            oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
-        );
-        Ok(Self::info_from_meta(&meta_json, Some(oid)))
+        self.finish_cdp_result(&meta_json, &oid)
     }
     pub async fn call_function_on(
         &mut self,
@@ -2818,11 +2831,7 @@ impl ObscuraJsRuntime {
         } else {
             meta_str
         };
-        self.object_store.insert(
-            oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
-        );
-        Ok(Self::info_from_meta(&meta_json, Some(oid)))
+        self.finish_cdp_result(&meta_json, &oid)
     }
 
     pub fn release_object(&mut self, object_id: &str) {
@@ -3136,6 +3145,18 @@ impl ObscuraJsRuntime {
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
         self.begin_javascript_task();
         let script_url = name.to_string();
+        // Reuse only serialized compilation data, never a context or live value.
+        // Exact source matching also protects same-URL, same-length edits that
+        // V8's cache validation alone does not identify. Internal/eval snippets
+        // and opaque document origins do not enter this process-wide cache.
+        let cache_origin = (source.len() >= 4096 && source.len() <= CLASSIC_CODE_CACHE_BYTES / 2
+            && url::Url::parse(name).is_ok_and(|url| matches!(url.scheme(), "http" | "https")))
+            .then(|| url::Url::parse(&self.state.borrow().url).ok())
+            .flatten()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .map(|url| url.origin().ascii_serialization());
+        let cached = cache_origin.as_deref().and_then(|origin| cached_classic_code(origin, name, source));
+        let source_text = source;
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
@@ -3165,7 +3186,17 @@ impl ObscuraJsRuntime {
                 None,
             );
             v8::tc_scope!(let tc_scope, scope);
-            let script = deno_core::v8::Script::compile(tc_scope, source, Some(&origin));
+            let mut compilation = match cached.as_deref() {
+                Some(bytes) => v8::script_compiler::Source::new_with_cached_data(
+                    source, Some(&origin), v8::script_compiler::CachedData::new(bytes)),
+                None => v8::script_compiler::Source::new(source, Some(&origin)),
+            };
+            let script = v8::script_compiler::compile(
+                tc_scope, &mut compilation,
+                if cached.is_some() { v8::script_compiler::CompileOptions::ConsumeCodeCache }
+                else { v8::script_compiler::CompileOptions::NoCompileOptions },
+                v8::script_compiler::NoCacheReason::NoReason,
+            );
             let Some(script) = script else {
                 if tc_scope.is_execution_terminating() {
                     tc_scope.cancel_terminate_execution();
@@ -3206,10 +3237,22 @@ impl ObscuraJsRuntime {
                     )),
                 };
             }
+            let cache_accepted = compilation.get_cached_data().is_some_and(|data| !data.rejected());
+            #[cfg(test)]
+            if cache_accepted {
+                CLASSIC_CODE_CACHE_ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // A browser runs the microtask checkpoint at the end of each task.
             // queueMicrotask/observer delivery from this script is observable
             // to the caller (canvas damage, resize/intersection bookkeeping).
             tc_scope.perform_microtask_checkpoint();
+            if !cache_accepted {
+                if let Some(cache_origin) = cache_origin.as_deref() {
+                    if let Some(data) = script.get_unbound_script(tc_scope).create_code_cache() {
+                        remember_classic_code(cache_origin, &script_url, source_text, &data);
+                    }
+                }
+            }
             Ok(())
         })();
         let result = match result {
@@ -3246,40 +3289,9 @@ impl ObscuraJsRuntime {
             return self.execute_classic_script(name, source);
         }
 
-        let isolate_handle = self.runtime().v8_isolate().thread_safe_handle();
-
-        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let pair_clone = pair.clone();
-
-        let watchdog = std::thread::spawn(move || {
-            let (lock, cvar) = &*pair_clone;
-            let mut cancelled = lock.lock().unwrap();
-            let deadline = std::time::Instant::now() + timeout;
-
-            loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    isolate_handle.terminate_execution();
-                    return;
-                }
-
-                let result = cvar.wait_timeout(cancelled, remaining).unwrap();
-                cancelled = result.0;
-                if *cancelled {
-                    return;
-                }
-            }
-        });
-
+        let watchdog = self.arm_watchdog(timeout);
         let result = self.execute_classic_script(name, source);
-
-        {
-            let (lock, cvar) = &*pair;
-            let mut cancelled = lock.lock().unwrap();
-            *cancelled = true;
-            cvar.notify_one();
-        }
-        let _ = watchdog.join();
+        self.disarm_watchdog(watchdog);
 
         match result {
             Ok(()) => Ok(()),
@@ -3390,7 +3402,7 @@ impl ObscuraJsRuntime {
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
     /// synchronous loop or a microtask storm pins the OS thread inside V8, so
     /// `tokio::time::timeout` (which can only cancel at await points) never
-    /// fires. This spawns a watchdog thread that terminates the isolate once
+    /// fires. The shared watchdog thread terminates the isolate once
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
@@ -3973,8 +3985,9 @@ impl ObscuraJsRuntime {
             None
         }
     }
-    fn make_oid(&self, counter: u64) -> String {
-        format!("{{\"injectedScriptId\":1,\"id\":{}}}", counter)
+    fn make_oid(&self, _counter: u64) -> String {
+        let id = NEXT_CDP_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{{\"injectedScriptId\":1,\"id\":{}}}", id)
     }
 
     fn wrap_expression(expression: &str) -> String {
@@ -4168,26 +4181,78 @@ impl ObscuraJsRuntime {
         Ok(serde_json::Value::String(s))
     }
 
+    fn finish_cdp_result(
+        &mut self,
+        meta: &serde_json::Value,
+        oid: &str,
+    ) -> Result<RemoteObjectInfo, String> {
+        // Primitive results have no client handle to release. Preserve their
+        // V8 types and remove the temporary root, just like by-value results.
+        if !matches!(meta.get("type").and_then(|v| v.as_str()),
+            Some("object" | "function" | "symbol")) || meta["subtype"] == "null"
+        {
+            return self.take_cdp_result_by_value(oid);
+        }
+        self.object_store.insert(
+            oid.to_string(),
+            format!("globalThis.__obscura_objects['{}']", oid),
+        );
+        Ok(Self::info_from_meta(meta, Some(oid.to_string())))
+    }
+
+    fn take_cdp_result_by_value(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
+        // The client receives no handle to release. Keep the value rooted in
+        // V8's returned Global while removing the temporary page reference.
+        let value = self.execute_runtime_script(
+            "<takeResult>",
+            format!("(function() {{ var result = globalThis.__obscura_objects['{oid}']; \
+                delete globalThis.__obscura_objects['{oid}']; return result; }})()"),
+        ).map_err(|e| format!("JS error: {}", e))?;
+        self.v8_to_cdp_value(value)
+    }
+
     fn v8_to_cdp_value(
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<RemoteObjectInfo, String> {
-        // JSON collapses undefined into null. Classify it before serialization.
-        let is_undefined = {
+        // JSON cannot preserve undefined, bigint, or exceptional numbers.
+        let primitive = {
             let mut entered = self.runtime();
-            let isolate = entered.v8_isolate();
-            deno_core::v8::scope!(let scope, isolate);
-            deno_core::v8::Local::new(scope, &result).is_undefined()
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            let value = deno_core::v8::Local::new(scope, &result);
+            if value.is_undefined() {
+                Some(("undefined", None))
+            } else if value.is_big_int() {
+                Some(("bigint", Some(format!("{}n", value.to_rust_string_lossy(scope)))))
+            } else if value.is_number() {
+                let number = value.number_value(scope).unwrap();
+                let text = if number.is_nan() {
+                    Some("NaN")
+                } else if number == f64::INFINITY {
+                    Some("Infinity")
+                } else if number == f64::NEG_INFINITY {
+                    Some("-Infinity")
+                } else if number == 0.0 && number.is_sign_negative() {
+                    Some("-0")
+                } else {
+                    None
+                };
+                text.map(|text| ("number", Some(text.to_string())))
+            } else {
+                None
+            }
         };
-        if is_undefined {
+        if let Some((kind, unserializable_value)) = primitive {
             return Ok(RemoteObjectInfo {
                 thrown: false,
-                js_type: "undefined".into(),
+                js_type: kind.into(),
                 subtype: None,
                 class_name: String::new(),
-                description: String::new(),
+                description: unserializable_value.clone().unwrap_or_default(),
                 object_id: None,
                 value: None,
+                unserializable_value,
             });
         }
         let value = self.v8_to_json(result)?;
@@ -4204,6 +4269,7 @@ impl ObscuraJsRuntime {
                 description: "null".into(),
                 object_id: None,
                 value: Some(serde_json::Value::Null),
+                unserializable_value: None,
             },
             serde_json::Value::Bool(b) => RemoteObjectInfo {
                 thrown: false,
@@ -4213,6 +4279,7 @@ impl ObscuraJsRuntime {
                 description: b.to_string(),
                 object_id: None,
                 value: Some(value.clone()),
+                unserializable_value: None,
             },
             serde_json::Value::Number(n) => RemoteObjectInfo {
                 thrown: false,
@@ -4222,6 +4289,7 @@ impl ObscuraJsRuntime {
                 description: n.to_string(),
                 object_id: None,
                 value: Some(value.clone()),
+                unserializable_value: None,
             },
             serde_json::Value::String(s) => RemoteObjectInfo {
                 thrown: false,
@@ -4231,6 +4299,7 @@ impl ObscuraJsRuntime {
                 description: s.clone(),
                 object_id: None,
                 value: Some(value.clone()),
+                unserializable_value: None,
             },
             serde_json::Value::Array(arr) => RemoteObjectInfo {
                 thrown: false,
@@ -4240,6 +4309,7 @@ impl ObscuraJsRuntime {
                 description: format!("Array({})", arr.len()),
                 object_id: None,
                 value: Some(value.clone()),
+                unserializable_value: None,
             },
             serde_json::Value::Object(_) => RemoteObjectInfo {
                 thrown: false,
@@ -4249,6 +4319,7 @@ impl ObscuraJsRuntime {
                 description: "Object".into(),
                 object_id: None,
                 value: Some(value.clone()),
+                unserializable_value: None,
             },
         }
     }
@@ -4271,11 +4342,7 @@ impl ObscuraJsRuntime {
         } else {
             meta
         };
-        self.object_store.insert(
-            oid.to_string(),
-            format!("globalThis.__obscura_objects['{}']", oid),
-        );
-        let mut info = Self::info_from_meta(&meta_json, Some(oid.to_string()));
+        let mut info = self.finish_cdp_result(&meta_json, oid)?;
         info.thrown = true;
         Ok(info)
     }
@@ -4301,14 +4368,6 @@ impl ObscuraJsRuntime {
             .unwrap_or("")
             .to_string();
 
-        let value = if js_type != "object" && js_type != "function" {
-            meta.get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| serde_json::Value::String(s.to_string()))
-        } else {
-            None
-        };
-
         RemoteObjectInfo {
             thrown: false,
             js_type,
@@ -4316,7 +4375,8 @@ impl ObscuraJsRuntime {
             class_name,
             description,
             object_id,
-            value,
+            value: None,
+            unserializable_value: None,
         }
     }
 }
@@ -4329,8 +4389,74 @@ impl Default for ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn classic_code_cache_reuses_compilation_not_page_state() {
+        use std::sync::atomic::Ordering;
+        let declarations = (0..256).map(|i| format!("function f{i}(){{return {i};}}"))
+            .collect::<String>();
+        let source = format!("{declarations}\nglobalThis.answer=f137();\
+            globalThis.runs=(globalThis.runs||0)+1;");
+        let url = "https://code-cache.test/app.js";
+        for _ in 0..2 {
+            let mut runtime = super::ObscuraJsRuntime::with_base_url("https://code-cache.test/page");
+            runtime.set_url("https://code-cache.test/page");
+            runtime.execute_script(url, &source).unwrap();
+            assert_eq!(runtime.evaluate("[answer,runs]").unwrap(), serde_json::json!([137,1]));
+            runtime.execute_script("<mutate>", "answer=999;runs=99;").unwrap();
+        }
+        assert_eq!(super::CLASSIC_CODE_CACHE_ACCEPTED.load(Ordering::Relaxed), 1,
+            "fresh isolate should consume compiled data for identical source");
+        // Same URL and byte length must not make changed source share bytecode.
+        let changed = source.replace("return 137;", "return 731;");
+        let mut runtime = super::ObscuraJsRuntime::with_base_url("https://code-cache.test/page");
+        runtime.set_url("https://code-cache.test/page");
+        runtime.execute_script(url, &changed).unwrap();
+        assert_eq!(runtime.evaluate("[answer,runs]").unwrap(), serde_json::json!([731,1]));
+        assert_eq!(super::CLASSIC_CODE_CACHE_ACCEPTED.load(Ordering::Relaxed), 1);
+        drop(runtime);
+        let mut other_origin = super::ObscuraJsRuntime::with_base_url("https://other.test/page");
+        other_origin.set_url("https://other.test/page");
+        other_origin.execute_script(url, &changed).unwrap();
+        assert_eq!(other_origin.evaluate("[answer,runs]").unwrap(), serde_json::json!([731,1]));
+        assert_eq!(super::CLASSIC_CODE_CACHE_ACCEPTED.load(Ordering::Relaxed), 1,
+            "code reuse is partitioned by document origin");
+    }
+
     use super::*;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn completed_scripts_do_not_wait_for_watchdog_deadline() {
+        let mut rt = ObscuraJsRuntime::new();
+        for _ in 0..200 {
+            let started = std::time::Instant::now();
+            rt.execute_script_with_timeout(
+                "fast-script", "globalThis.completed = true;",
+                std::time::Duration::from_secs(2),
+            ).unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(1),
+                "completed script waited for its cancelled watchdog: {:?}", started.elapsed());
+        }
+        assert_eq!(rt.evaluate("globalThis.completed").unwrap(), serde_json::json!(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlapping_watchdogs_do_not_allocate_a_thread_per_deadline() {
+        let mut rt = ObscuraJsRuntime::new();
+        let thread_count = || std::fs::read_dir("/proc/self/task").unwrap().count();
+        let before = thread_count();
+        let guards: Vec<_> = (0..64)
+            .map(|_| rt.arm_watchdog(std::time::Duration::from_secs(30)))
+            .collect();
+        let armed = thread_count();
+        for guard in guards {
+            assert!(!rt.disarm_watchdog(guard));
+        }
+        assert!(armed <= before + 8,
+            "bounded operations created unbounded watchdog threads: {before} -> {armed}");
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+    }
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
@@ -7315,6 +7441,99 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_exposes_generated_pseudo_content() {
+        let mut rt = setup_runtime(
+            r#"<html><head><style>label::before { content: "❯"; }</style></head>
+                <body><label id="toggle">Mark all as complete</label></body></html>"#,
+        );
+        assert_eq!(
+            rt.evaluate(
+                "const style = getComputedStyle(document.getElementById('toggle'), '::before');\
+                 return [style.content, style.display]"
+            ).unwrap(),
+            serde_json::json!(["\"❯\"", "inline"])
+        );
+    }
+
+    #[test]
+    fn non_bubbling_events_reach_capture_listeners_on_ancestors() {
+        let mut rt = setup_runtime("<html><body><input id='editor'></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                "let seen = [];\
+                 document.addEventListener('blur', event => seen.push([event.target.id, event.eventPhase]), true);\
+                 document.getElementById('editor').dispatchEvent(new FocusEvent('blur'));\
+                 return seen"
+            ).unwrap(),
+            serde_json::json!([["editor", 1]])
+        );
+    }
+
+    #[test]
+    fn meta_http_equiv_reflection_supports_snapshot_csp_filtering() {
+        let mut rt = setup_runtime(
+            r#"<html><head><meta id="plain" charset="utf-8">
+                <meta id="policy" http-equiv="Content-Security-Policy" content="default-src 'self'">
+            </head><body></body></html>"#,
+        );
+        let result = rt.evaluate(r#"
+            const plain = document.getElementById('plain');
+            const policy = document.getElementById('policy');
+            const kept = Array.from(document.querySelectorAll('meta'))
+                .filter(node => node.httpEquiv.toLowerCase() !== 'content-security-policy')
+                .map(node => node.id);
+            const created = document.createElement('meta');
+            created.httpEquiv = 'Refresh';
+            const cloned = created.cloneNode();
+            const initial = [plain.httpEquiv, policy.httpEquiv,
+                created.getAttribute('http-equiv'), cloned.httpEquiv];
+            created.setAttribute('http-equiv', 'Content-Type');
+            const changed = created.httpEquiv;
+            created.removeAttribute('http-equiv');
+            const removed = created.httpEquiv;
+            created.httpEquiv = null;
+            return [kept, initial, changed, removed, created.getAttribute('http-equiv'),
+                plain instanceof HTMLMetaElement, cloned instanceof HTMLMetaElement,
+                document.createElement('div') instanceof HTMLMetaElement,
+                document.createElementNS('urn:test', 'META').cloneNode() instanceof HTMLMetaElement];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            ["plain"], ["", "Content-Security-Policy", "Refresh", "Refresh"],
+            "Content-Type", "", "null", true, true, false, false
+        ]));
+    }
+
+    #[test]
+    fn input_brand_separates_button_labels_and_preserves_native_setters() {
+        let mut rt = setup_runtime(
+            r#"<html><body><button id="button" type="button">Visible label</button>
+                <input id="input" type="button" value="Input label"><div id="other"></div>
+            </body></html>"#,
+        );
+        let result = rt.evaluate(r#"
+            const button = document.getElementById('button');
+            const input = document.getElementById('input');
+            const created = document.createElement('input');
+            const brands = [input, button, document.getElementById('other'), created,
+                document.createElementNS('http://www.w3.org/1999/xhtml', 'x:input'),
+                document.createElementNS('urn:test', 'INPUT').cloneNode(), input.cloneNode()]
+                .map(node => node instanceof HTMLInputElement);
+            const label = node => node instanceof HTMLInputElement && node.type === 'button'
+                ? node.value : node.textContent;
+            const labels = [label(button), label(input)];
+            const value = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            const checked = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+            value.set.call(created, 'edited');
+            checked.set.call(created, true);
+            return [brands, labels, value.get.call(created), checked.get.call(created)];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [true, false, false, true, true, false, true],
+            ["Visible label", "Input label"], "edited", true
+        ]));
+    }
+
+    #[test]
     fn hyperlink_content_attributes_reflect_through_the_idl_surface() {
         let mut rt = setup_runtime(
             r#"<html><body>
@@ -7469,6 +7688,35 @@ mod tests {
         assert_eq!(result["atomic"], serde_json::json!([80, 30]));
         assert_eq!(result["replaced"], serde_json::json!([80, 30]));
         assert_eq!(result["item"], serde_json::json!([90, 25, "block"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_non_geometric_reads_defer_layout_without_losing_damage() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(r#"<!doctype html><style>
+            body { margin:0; --tone:blue; color:var(--tone) }
+            body[data-active=yes] { --tone:red }
+            #box { width:80px; height:20px }
+            body[data-active=yes] #box { width:160px }
+        </style><body><div id=box>text</div></body>"#));
+        rt.set_viewport(400.0, 200.0);
+        rt.run_page_init();
+        assert_eq!(rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap(), serde_json::json!(80.0));
+        let result = rt.evaluate(r#"(() => {
+            globalThis.savedStyle = getComputedStyle(document.getElementById('box'));
+            document.body.setAttribute('data-active', 'yes');
+            return [savedStyle.color, savedStyle.display, savedStyle.opacity];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["rgb(255, 0, 0)", "block", "1"]));
+        assert!(!rt.state.borrow().pending_style_mutations.is_empty(),
+            "a non-geometric read must leave pending layout damage for the next geometry consumer");
+        assert_eq!(rt.evaluate("savedStyle.width").unwrap(), serde_json::json!("160px"));
+        assert!(rt.state.borrow().pending_style_mutations.is_empty());
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.body.removeAttribute('data-active');
+            return [savedStyle.color, savedStyle.width, savedStyle.length > 20];
+        })()"#).unwrap(), serde_json::json!(["rgb(0, 0, 255)", "80px", true]));
     }
 
     #[cfg(feature = "render")]
@@ -7904,8 +8152,9 @@ mod tests {
             "globalThis.__deepIntervalTicks = 0;\
              function installDeepInterval(depth) {\
                if (depth === 0) {\
+                 globalThis.__deepIntervalInstalledAt = performance.now();\
                  globalThis.__deepInterval = setInterval(\
-                   () => __deepIntervalTicks++, 0);\
+                   () => { __deepIntervalTicks++; globalThis.__deepIntervalFiredAt = performance.now(); }, 0);\
                } else {\
                  setTimeout(() => installDeepInterval(depth - 1), 0);\
                }\
@@ -7914,26 +8163,32 @@ mod tests {
         )
         .unwrap();
 
-        for _ in 0..8 {
-            if rt
-                .evaluate("globalThis.__deepInterval !== undefined")
-                .unwrap()
-                == serde_json::json!(true)
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while rt.evaluate("globalThis.__deepInterval !== undefined").unwrap()
+                != serde_json::json!(true)
             {
-                break;
+                rt.run_autonomous_event_loop_turn().await.unwrap();
             }
-            rt.run_autonomous_event_loop_turn().await.unwrap();
-        }
+        }).await.expect("nested interval was installed");
         assert_eq!(
             rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
             serde_json::json!(0.0),
             "an interval installed by a level-six timer must clamp before its first tick",
         );
-        rt.run_autonomous_event_loop_turn().await.unwrap();
+        // A cooperative turn can return on deno_core's internal self-wake
+        // before a timer is due. Assert delivery and the HTML minimum delay,
+        // not a one-to-one relationship between wakes and timer callbacks.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while rt.evaluate("globalThis.__deepIntervalTicks").unwrap() == serde_json::json!(0.0) {
+                rt.run_autonomous_event_loop_turn().await.unwrap();
+            }
+        }).await.expect("nested interval delivered its first callback");
         assert_eq!(
             rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
             serde_json::json!(1.0),
         );
+        assert!(rt.evaluate("__deepIntervalFiredAt - __deepIntervalInstalledAt")
+            .unwrap().as_f64().unwrap() >= 4.0, "nested intervals must retain the four-ms clamp");
         rt.execute_script(
             "clear-deep-interval",
             "clearInterval(globalThis.__deepInterval)",
@@ -8057,6 +8312,22 @@ mod tests {
             serde_json::json!("usable"),
             "the per-turn watchdog must leave the isolate reusable",
         );
+    }
+
+    #[test]
+    fn cancelling_one_watchdog_preserves_other_deadlines_and_recovery() {
+        let mut rt = ObscuraJsRuntime::new();
+        let deadline = rt.arm_watchdog(std::time::Duration::from_millis(100));
+        let cancelled = rt.arm_watchdog(std::time::Duration::from_secs(30));
+        drop(cancelled);
+        // An independent backstop keeps a broken slot implementation bounded.
+        rt.execute_script_with_timeout(
+            "overlapping-deadlines",
+            "while (true) {}",
+            std::time::Duration::from_secs(2),
+        ).unwrap();
+        assert!(rt.disarm_watchdog(deadline));
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
     }
 
     #[test]
@@ -13564,6 +13835,170 @@ mod tests {
     }
 
     #[test]
+    fn stylesheet_cssom_exposes_trace_instrumentation_interfaces() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                "return [typeof StyleSheet, typeof CSSGroupingRule,\
+                  new CSSStyleSheet() instanceof StyleSheet,\
+                  typeof CSSGroupingRule.prototype.insertRule,\
+                  typeof Object.getOwnPropertyDescriptor(StyleSheet.prototype, 'disabled')?.set]"
+            ).unwrap(),
+            serde_json::json!(["function", "function", true, "function", "function"])
+        );
+    }
+
+    #[test]
+    fn stylesheet_rule_iteration_does_not_copy_the_sheet_per_rule() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt.evaluate(r#"
+            (() => {
+                const style = document.createElement('style');
+                style.textContent = Array.from({length: 512}, (_, i) =>
+                    `.r${i} { width: ${i}px }`).join('\n');
+                document.head.append(style);
+                const sheet = style.sheet;
+                const descriptor = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent');
+                let reads = 0;
+                Object.defineProperty(style, 'textContent', {
+                    get() { reads++; return descriptor.get.call(this); },
+                    set(value) { descriptor.set.call(this, value); },
+                });
+                const rules = sheet.cssRules;
+                const selectors = Array.from(rules, rule => rule.selectorText);
+                const iterationReads = reads;
+                const first = rules[0];
+                first.style.width = '91px';
+                const edited = rules[0] === first && rules[0].style.width === '91px';
+                style.firstChild.data = '.replacement { height: 8px }';
+                const replaced = rules.length === 1 && rules[0].selectorText === '.replacement';
+                style.append(document.createTextNode('.appended { height: 9px }'));
+                const appended = rules.length === 2 && rules[1].selectorText === '.appended';
+                style.lastChild.remove();
+                return {iterationReads, count: selectors.length, last: selectors.at(-1),
+                    edited, replaced, appended, removed: rules.length === 1};
+            })()
+        "#).unwrap();
+        assert!(result["iterationReads"].as_u64().unwrap() <= 1,
+            "unchanged CSSRuleList iteration copied its whole source repeatedly: {result}");
+        assert_eq!(result["count"], 512);
+        assert_eq!(result["last"], ".r511");
+        for key in ["edited", "replaced", "appended", "removed"] {
+            assert_eq!(result[key], true, "live CSSOM lost {key}: {result}");
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn stylesheet_rule_writes_preserve_dom_source_and_update_layout() {
+        let mut rt = setup_runtime("<html><head><style id='rules'>#box { width: 11px }</style></head><body><div id='box'></div></body></html>");
+        let result = rt.evaluate(r#"
+            (() => {
+                const style = document.getElementById('rules');
+                const source = style.textContent;
+                const text = style.firstChild;
+                const sheet = style.sheet;
+                const first = sheet.cssRules[0];
+                const observer = new MutationObserver(() => {});
+                observer.observe(style, {subtree: true, childList: true, characterData: true});
+                let serialized = 0;
+                const descriptor = Object.getOwnPropertyDescriptor(CSSStyleRule.prototype, 'cssText');
+                Object.defineProperty(first, 'cssText', {get() {
+                    serialized++;
+                    return descriptor.get.call(this);
+                }});
+                for (let i = 0; i < 512; i++) sheet.insertRule(`.r${i} { height: ${i}px }`, sheet.cssRules.length);
+                sheet.insertRule('#box { width: 73px }', sheet.cssRules.length);
+                const inserted = document.getElementById('box').getBoundingClientRect().width;
+                sheet.cssRules[513].style.width = '91px';
+                const edited = document.getElementById('box').getBoundingClientRect().width;
+                sheet.deleteRule(513);
+                const deleted = document.getElementById('box').getBoundingClientRect().width;
+                const preserved = style.textContent === source && style.firstChild === text;
+                const records = observer.takeRecords().length;
+                observer.disconnect();
+                style.textContent = '#box { width: 17px }';
+                const reset = style.sheet.cssRules.length;
+                return {preserved, records, serialized, inserted, edited, deleted, reset};
+            })()
+        "#).unwrap();
+        assert_eq!(result["preserved"], true, "CSSOM writes changed DOM source: {result}");
+        assert_eq!(result["records"], 0, "CSSOM writes emitted DOM mutations: {result}");
+        assert!(result["serialized"].as_u64().unwrap() <= 4, "append serialized prior rules repeatedly: {result}");
+        assert_eq!(result["inserted"], 73);
+        assert_eq!(result["edited"], 91);
+        assert_eq!(result["deleted"], 11);
+        assert_eq!(result["reset"], 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn stylesheet_same_text_data_assignment_discards_cssom_override() {
+        let mut rt = setup_runtime("<html><head><style id='s'>#box { width: 11px }</style></head><body><div id='box'></div></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const style = document.getElementById('s');
+            const box = document.getElementById('box');
+            style.sheet.insertRule('#box { width: 73px }', 1);
+            const inserted = box.getBoundingClientRect().width;
+            style.firstChild.data = style.firstChild.data;
+            return [inserted, box.getBoundingClientRect().width, style.sheet.cssRules.length];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([73, 11, 1]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_storage_feature_detection_does_not_select_a_noop_backend() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate_for_cdp_with_timeout(r#"
+            (async () => {
+                const response = new Response('resource bytes');
+                if (!('caches' in globalThis)) return response.text();
+                const cache = await caches.open('capability-contract');
+                await cache.put('https://example.com/resource', response);
+                const stored = await cache.match('https://example.com/resource');
+                return stored ? stored.text() : null;
+            })()
+        "#, true, true, 1000).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("resource bytes")),
+            "an advertised cache must retain bytes, otherwise callers must be able to fall back");
+    }
+
+    #[test]
+    fn linked_stylesheet_reads_are_bounded_and_host_updates_invalidate() {
+        let mut rt = setup_runtime("<html><head><link id='sheet' rel='stylesheet' href='/rules.css'></head><body></body></html>");
+        let owner = rt.state.borrow().dom.as_ref().unwrap().get_element_by_id("sheet").unwrap();
+        let css = (0..512).map(|i| format!(".r{i} {{ width: {i}px }}")).collect::<Vec<_>>().join("\n");
+        assert!(rt.state.borrow().dom.as_ref().unwrap().replace_external_stylesheet(owner, css, true));
+        rt.execute_script("<linked-sheet>", "globalThis.__obscura_registerLinkedStylesheet(document.getElementById('sheet'), 'http://example.com/rules.css')").unwrap();
+        let result = rt.evaluate(r#"
+            (() => {
+                globalThis.linkedSheet = document.getElementById('sheet').sheet;
+                globalThis.linkedRules = linkedSheet.cssRules;
+                const parse = JSON.parse;
+                let copies = 0;
+                JSON.parse = function(source, ...args) {
+                    if (typeof source === 'string' && source.includes('"originClean"')) copies++;
+                    return parse(source, ...args);
+                };
+                try {
+                    const selectors = Array.from(linkedRules, rule => rule.selectorText);
+                    return { copies, count: selectors.length, last: selectors.at(-1) };
+                } finally { JSON.parse = parse; }
+            })()
+        "#).unwrap();
+        assert_eq!(result["count"], 512);
+        assert_eq!(result["last"], ".r511");
+        assert!(result["copies"].as_u64().unwrap() <= 1, "linked sheet copied per rule: {result}");
+        // Host loading bypasses JS DOM mutation hooks, including @import taint.
+        assert!(rt.state.borrow().dom.as_ref().unwrap().append_external_stylesheet(owner, ".host { height: 9px }".into(), true));
+        assert_eq!(rt.evaluate("[linkedRules.length, linkedRules[512].selectorText]").unwrap(), serde_json::json!([513, ".host"]));
+        assert!(rt.state.borrow().dom.as_ref().unwrap().append_external_stylesheet(owner, ".secret { color: red }".into(), false));
+        assert_eq!(rt.evaluate("(() => { try { linkedSheet.cssRules; return 'leaked'; } catch(e) { return e.name; } })()").unwrap(), serde_json::json!("SecurityError"));
+        assert!(rt.state.borrow().dom.as_ref().unwrap().replace_external_stylesheet(owner, ".replacement { width: 3px }".into(), true));
+        assert_eq!(rt.evaluate("[linkedRules.length, linkedRules[0].selectorText]").unwrap(), serde_json::json!([1, ".replacement"]));
+    }
+
+    #[test]
     fn inline_stylesheet_cssom_lists_and_rules_are_live_same_objects() {
         let mut rt = setup_runtime(
             r#"<html><head>
@@ -13675,7 +14110,7 @@ mod tests {
             serde_json::json!({
                 "initial": [true, 2, true, true, null, true, true, 2, true,
                     true, true, 1, ".one", "red", true],
-                "inserted": [3, true, ".middle", true],
+                "inserted": [3, true, ".middle", false],
                 "afterAppend": 3,
                 "emptyIdentity": true,
                 "emptyBecameLive": true,
@@ -13758,7 +14193,7 @@ mod tests {
                 64,
                 2,
                 "#box",
-                true
+                false
             ])
         );
     }
@@ -14442,9 +14877,11 @@ mod tests {
                     const greek = document.createElement('option');
                     greek.value = 'el';
                     greek.text = 'Greek';
+                    greek.setAttribute('label', 'Ελληνικά');
                     select.add(greek, 0);
                     return JSON.stringify({
                         labels: [...select.options].map(option => option.textContent),
+                        optionLabels: [...select.options].map(option => option.label),
                         selectedIndex: select.selectedIndex,
                         value: select.value,
                         html: select.outerHTML
@@ -14454,6 +14891,7 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
         assert_eq!(value["labels"], serde_json::json!(["Greek", "English"]));
+        assert_eq!(value["optionLabels"], serde_json::json!(["Ελληνικά", "English"]));
         assert_eq!(value["selectedIndex"], 1);
         assert_eq!(value["value"], "en");
         assert!(
@@ -15986,6 +16424,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cdp_by_value_results_do_not_retain_unreleasable_objects() {
+        let mut rt = ObscuraJsRuntime::new();
+        // A real remote handle must survive by-value calls until released.
+        let handle = rt.evaluate_for_cdp("({kept: 42})", false, true).await.unwrap();
+        let oid = handle.object_id.unwrap();
+        for await_promise in [false, true] {
+            for call_function in [false, true] {
+                for _ in 0..32 {
+                    let result = if call_function {
+                        rt.call_function_on_for_cdp(
+                            "function() { return {payload: Array(1024).fill(7)}; }",
+                            None, &[], true, await_promise,
+                        ).await.unwrap()
+                    } else {
+                        rt.evaluate_for_cdp(
+                            "({payload: Array(1024).fill(7)})", true, await_promise,
+                        ).await.unwrap()
+                    };
+                    assert!(result.object_id.is_none());
+                    assert_eq!(result.value.unwrap()["payload"].as_array().unwrap().len(), 1024);
+                }
+                assert_eq!(
+                    rt.evaluate("Object.keys(globalThis.__obscura_objects).length").unwrap(),
+                    serde_json::json!(1.0),
+                    "unreleasable JS results: call_function={call_function}, await_promise={await_promise}",
+                );
+                assert_eq!(rt.object_store.len(), 1, "unreleasable Rust handles");
+            }
+        }
+        let kept = rt.call_function_on_for_cdp(
+            "function() { return this.kept; }", Some(&oid), &[], true, false,
+        ).await.unwrap();
+        assert_eq!(kept.value, Some(serde_json::json!(42.0)));
+        rt.release_object(&oid);
+        assert_eq!(
+            rt.evaluate("Object.keys(globalThis.__obscura_objects).length").unwrap(),
+            serde_json::json!(0.0),
+        );
+        assert!(rt.object_store.is_empty());
+        assert_eq!(
+            rt.evaluate("Object.keys(globalThis).filter(key => key.startsWith('__obscura_done_')).length").unwrap(),
+            serde_json::json!(0.0),
+            "completed calls must not retain per-call completion globals",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn response_body_exposes_stream_and_consumption_state() {
         // #818: a non-null Response body must expose a ReadableStream through
         // .body, a boolean .bodyUsed, and a working getReader(); consuming
@@ -16223,6 +16708,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value.unwrap().as_str().unwrap(), "done");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_settled_promise_does_not_wait_for_unrelated_timer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let expression = "(() => {
+            globalThis.unrelatedTimerFinished = false;
+            setTimeout(() => { globalThis.unrelatedTimerFinished = true; }, 0);
+            return Promise.resolve(42);
+        })()";
+        for call_function in [false, true] {
+            let result = if call_function {
+                rt.call_function_on_for_cdp_with_timeout(
+                    &format!("() => {expression}"), None, &[], true, true, 1000,
+                ).await
+            } else {
+                rt.evaluate_for_cdp_with_timeout(expression, true, true, 1000).await
+            }.unwrap();
+            assert_eq!(result.value.and_then(|value| value.as_f64()), Some(42.0));
+            let timer = rt.evaluate_for_cdp("globalThis.unrelatedTimerFinished", true, false)
+                .await.unwrap();
+            assert_eq!(timer.value, Some(serde_json::json!(false)),
+                "an already-settled promise must not drain unrelated timers (callFunctionOn={call_function})");
+            rt.evaluate_for_cdp("new Promise(resolve => setTimeout(resolve, 10))", true, true)
+                .await.unwrap();
+            let timer = rt.evaluate_for_cdp("globalThis.unrelatedTimerFinished", true, false)
+                .await.unwrap();
+            assert_eq!(timer.value, Some(serde_json::json!(true)), "the timer must still run");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17279,24 +17793,31 @@ mod tests {
         );
     }
 
-    /// Guards the cache in `document_base_url_memoized`. Without it, each of these reads walked
-    /// the tree and ran the selector engine, and `a.href` went from a field read to O(nodes).
+    /// Base resolution is shared by URL reflection and retained geometry reads.
+    /// Neither may walk the document again for every read in a snapshot.
     /// The bound is deliberately loose: it should catch the regression, not watch the allocator.
     #[test]
-    fn anchor_href_reads_do_not_scale_with_document_size() {
+    fn base_dependent_reads_do_not_scale_with_document_size() {
         let mut body = String::from(r#"<html><head></head><body><a id="link" href="x.json"></a>"#);
         for i in 0..4000 {
             body.push_str(&format!("<div id=\"n{i}\"><span>text</span></div>"));
         }
         body.push_str("</body></html>");
         let mut rt = setup_runtime_at_deep_url(&body);
+        // Build layout before timing reads, so the bound measures reuse rather
+        // than font loading or the initial layout of the large document.
+        rt.evaluate("document.getElementById('n0').getBoundingClientRect()").unwrap();
 
         let elapsed = rt
             .evaluate(
                 r#"
                 const link = document.getElementById('link');
+                const box = document.getElementById('n0');
                 const started = Date.now();
-                for (let i = 0; i < 2000; i++) { link.href; }
+                for (let i = 0; i < 2000; i++) {
+                    link.href; box.scrollTop; box.scrollLeft;
+                    getComputedStyle(box, '::before').content;
+                }
                 return Date.now() - started;
                 "#,
             )
@@ -17304,8 +17825,58 @@ mod tests {
         let ms = elapsed.as_f64().expect("elapsed ms");
         assert!(
             ms < 500.0,
-            "2000 a.href reads on a document with 12000 nodes took {ms} ms, the base query is not cached"
+            "2000 URL/scroll/style reads on a document with 12000 nodes took {ms} ms, the base query is not cached"
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_reads_track_base_mutations_and_document_replacement() {
+        let mut rt = setup_runtime_at_deep_url("<html><head></head><body><div>box</div></body></html>");
+        for (mutation, expected) in [
+            ("", "http://example.com/deep/page"),
+            ("document.head.innerHTML = '<base href=\"/assets/\">';", "http://example.com/assets/"),
+            ("document.querySelector('base').setAttribute('href', 'relative/');", "http://example.com/deep/relative/"),
+            ("document.querySelector('base').remove();", "http://example.com/deep/page"),
+        ] {
+            rt.evaluate(&format!("(() => {{ {mutation} return document.body.scrollTop; }})()")).unwrap();
+            assert_eq!(rt.state.borrow().prepared_render.as_ref().unwrap().base_url(), Some(expected));
+        }
+        rt.set_url("http://example.com/other/page");
+        rt.evaluate("document.body.scrollTop").unwrap();
+        assert_eq!(rt.state.borrow().prepared_render.as_ref().unwrap().base_url(), Some("http://example.com/other/page"));
+        rt.set_dom(parse_html("<html><head><base href='/replacement/'></head><body></body></html>"));
+        rt.run_page_init();
+        rt.evaluate("document.body.scrollTop").unwrap();
+        assert_eq!(rt.state.borrow().prepared_render.as_ref().unwrap().base_url(), Some("http://example.com/replacement/"));
+        // Embedders can mutate DomTree directly between JavaScript tasks,
+        // without going through the JS mutation/activity counter.
+        rt.with_dom(|dom| {
+            let base = dom.query_selector("base").unwrap().unwrap();
+            dom.with_node_mut(base, |node| node.set_attribute("href", "/native/".into()));
+        });
+        rt.evaluate("document.body.scrollTop").unwrap();
+        assert_eq!(rt.state.borrow().prepared_render.as_ref().unwrap().base_url(), Some("http://example.com/native/"));
+        rt.with_dom(|dom| {
+            let base = dom.query_selector("base").unwrap().unwrap();
+            dom.with_node_mut(base, |node| node.set_attribute("href", "/native-style/".into()));
+        });
+        rt.evaluate("getComputedStyle(document.body, '::before').content").unwrap();
+        assert_eq!(rt.state.borrow().prepared_render.as_ref().unwrap().base_url(), Some("http://example.com/native-style/"));
+        rt.evaluate(r#"(() => {
+            getComputedStyle(document.body, '::before').content;
+            document.querySelector('base').setAttribute('href', '/script-style/');
+            return getComputedStyle(document.body, '::before').content;
+        })()"#).unwrap();
+        assert_eq!(rt.state.borrow().prepared_render.as_ref().unwrap().base_url(), Some("http://example.com/script-style/"));
+        // Native paint can run without starting another JS task. It must not
+        // reuse the task's base after a host-side edit.
+        rt.with_dom(|dom| {
+            let base = dom.query_selector("base").unwrap().unwrap();
+            dom.with_node_mut(base, |node| node.set_attribute("href", "/native-paint/".into()));
+        });
+        crate::ops::ensure_prepared_render(&mut rt.state.borrow_mut());
+        assert_eq!(rt.state.borrow().prepared_render.as_ref().unwrap().base_url(), Some("http://example.com/native-paint/"));
     }
 
     #[test]
@@ -18068,6 +18639,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.value.unwrap(), serde_json::json!("arrived"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn intercepted_fetch_completion_keeps_request_identity_and_body() {
+        let mut rt = redirect_chain_runtime(1);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        let fetch = rt.call_function_on_for_cdp(
+            "async () => (await fetch('/hop/0')).text()", None, &[], true, true,
+        );
+        let resolve = async {
+            let request = rx.recv().await.expect("intercepted fetch");
+            request.resolver.send(crate::ops::InterceptResolution::Continue {
+                url: None, method: None, headers: None, body: None,
+            }).unwrap();
+            request.request_id
+        };
+        let (result, request_id) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            async { tokio::join!(fetch, resolve) },
+        ).await.expect("fetch completion");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!("arrived"));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, request_id, "response must complete the intercepted request");
+        assert_eq!(rt.get_network_response_body(&request_id).unwrap().body, "arrived");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20825,6 +21423,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("writer,one,two"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_rejection_handlers_are_delivered_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("rejection-handlers", r#"
+            globalThis.__rejectionEvents = [];
+            onunhandledrejection = () => __rejectionEvents.push('unhandled');
+            onrejectionhandled = () => __rejectionEvents.push('handled');
+            globalThis.__rejected = Promise.reject('probe');
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.execute_script("handle-rejection", "__rejected.catch(() => {});").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__rejectionEvents").unwrap(),
+            serde_json::json!(["unhandled", "handled"]));
     }
 
     /// #699: an unhandled rejection from a failed dynamic import is page-local

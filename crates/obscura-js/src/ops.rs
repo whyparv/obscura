@@ -60,6 +60,7 @@ pub enum InterceptResolution {
 
 pub struct InterceptedRequest {
     pub request_id: String,
+    pub page_id: String,
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
@@ -83,6 +84,8 @@ pub struct JsNetworkEvent {
     /// Matches the `fetch-{N}` id under which the body is stored, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
+    /// The interception consumer already received the request start.
+    pub intercepted: bool,
     pub url: String,
     pub method: String,
     pub status: u16,
@@ -131,8 +134,8 @@ pub struct ObscuraState {
     pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub pending_navigation: Option<(String, String, String)>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
-    pub intercept_counter: u64,
     pub intercept_enabled: bool,
+    pub intercept_page_id: String,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
@@ -146,7 +149,6 @@ pub struct ObscuraState {
     pub runtime_exception_counter: u64,
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
-    pub network_response_body_counter: u64,
     // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
     // just static DOM attributes, are listed (issue #301).
@@ -357,8 +359,8 @@ impl ObscuraState {
             stealth_client: None,
             pending_navigation: None,
             intercept_tx: None,
-            intercept_counter: 0,
             intercept_enabled: false,
+            intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
             runtime_events_enabled: false,
@@ -367,7 +369,6 @@ impl ObscuraState {
             runtime_exception_counter: 0,
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
-            network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
@@ -847,7 +848,7 @@ fn render_mutation_impact(
                 // Moving a connected node into a detached subtree removes its
                 // old box, while attaching a detached node creates a new one.
                 connected: node_is_connected(dom, parent) || node_is_connected(dom, child),
-                actual_change: !already_last,
+                actual_change: !already_last || dom.has_cssom_stylesheet(parent) || dom.has_cssom_stylesheet(child),
             }
         }
         "remove_child" => {
@@ -875,7 +876,8 @@ fn render_mutation_impact(
                 dom.get_node(reference).and_then(|node| node.prev_sibling) == Some(new_node);
             RenderMutationImpact {
                 connected: node_is_connected(dom, reference_parent) || new_was_connected,
-                actual_change: new_node != reference && !already_immediately_before,
+                actual_change: new_node != reference && (!already_immediately_before
+                    || dom.has_cssom_stylesheet(reference_parent) || dom.has_cssom_stylesheet(new_node)),
             }
         }
         "set_inner_html" | "set_inner_html_context" => {
@@ -895,7 +897,10 @@ fn render_mutation_impact(
             };
             let changed = dom
                 .with_node(target, |node| match &node.data {
-                    NodeData::Text { contents } | NodeData::Comment { contents } => {
+                    NodeData::Text { contents } => {
+                        contents.as_str() != arg2 || node.parent.is_some_and(|parent| dom.has_cssom_stylesheet(parent))
+                    }
+                    NodeData::Comment { contents } => {
                         contents.as_str() != arg2
                     }
                     NodeData::ProcessingInstruction { data, .. } => data.as_str() != arg2,
@@ -1413,6 +1418,58 @@ fn op_external_stylesheet_remove(state: &OpState, owner_nid: u32, frame_id: u32)
         }
     }
     changed
+}
+
+/// CSSOM sources change through both DOM operations and native stylesheet loading.
+#[op2(fast)]
+fn op_stylesheet_generation(state: &OpState, frame_id: u32, linked: bool) -> f64 {
+    let shared = frame_state(state, frame_id);
+    let state = shared.borrow();
+    let generation = if linked {
+        state.dom.as_ref().map_or(0, |dom| dom.external_stylesheet_generation())
+    } else {
+        state.activity_generation.wrapping_add(
+            state.dom.as_ref().map_or(0, |dom| dom.external_stylesheet_generation()))
+    };
+    generation as f64
+}
+
+#[op2(fast)]
+fn op_cssom_stylesheet_has(state: &OpState, owner_nid: u32, frame_id: u32) -> bool {
+    frame_state(state, frame_id).borrow().dom.as_ref()
+        .is_some_and(|dom| dom.has_cssom_stylesheet(NodeId::new(owner_nid)))
+}
+
+fn invalidate_cssom_render(state: &mut ObscuraState) {
+    state.activity_generation = state.activity_generation.wrapping_add(1);
+    #[cfg(feature = "render")]
+    {
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+        state.resolved_scroll = None;
+    }
+}
+
+#[op2]
+fn op_cssom_stylesheet_update(
+    state: &OpState, owner_nid: u32, index: u32, delete_count: u32,
+    #[serde] rules: Vec<String>, reset: bool, frame_id: u32,
+) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let changed = state.dom.as_ref().is_some_and(|dom| dom.update_cssom_stylesheet(
+        NodeId::new(owner_nid), index as usize, delete_count as usize, rules, reset));
+    if changed { invalidate_cssom_render(&mut state); }
+    changed
+}
+
+#[op2(fast)]
+fn op_cssom_stylesheet_clear(state: &OpState, owner_nid: u32, frame_id: u32) {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    if state.dom.as_ref().is_some_and(|dom| dom.clear_cssom_stylesheet(NodeId::new(owner_nid))) {
+        invalidate_cssom_render(&mut state);
+    }
 }
 
 /// Return CSSOM-readable bytes only for an origin-clean loaded sheet.
@@ -2974,7 +3031,7 @@ async fn op_fetch_url(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -3008,11 +3065,13 @@ async fn op_fetch_url(
             gs.intercept_enabled,
             gs.intercept_tx.is_some()
         );
+        // Allocate once, before interception. CDP must use this identity for
+        // the request start, completion and retained response body.
+        // The CDP resolver map spans pages and navigations on a connection.
+        static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let itx = if gs.intercept_enabled {
-            gs.intercept_counter += 1;
-            gs.intercept_tx
-                .clone()
-                .map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
+            gs.intercept_tx.clone()
         } else {
             None
         };
@@ -3021,6 +3080,8 @@ async fn op_fetch_url(
             in_flight,
             Arc::clone(&gs.page_in_flight),
             itx,
+            gs.intercept_page_id.clone(),
+            request_id,
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
@@ -3067,12 +3128,14 @@ async fn op_fetch_url(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
-    if let Some((tx, request_id)) = intercept_tx {
+    let mut was_intercepted = false;
+    if let Some(tx) = intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
+            page_id,
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
@@ -3080,6 +3143,7 @@ async fn op_fetch_url(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
+            was_intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
                     status,
@@ -3579,8 +3643,6 @@ async fn op_fetch_url(
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
-        gs.network_response_body_counter += 1;
-        let request_id = format!("fetch-{}", gs.network_response_body_counter);
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
         if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
@@ -3608,6 +3670,7 @@ async fn op_fetch_url(
             .as_secs_f64();
         gs.js_network_events.push(JsNetworkEvent {
             request_id: request_id.clone(),
+            intercepted: was_intercepted,
             url: current_url.clone(),
             method: current_method.as_str().to_string(),
             status,
@@ -6106,6 +6169,10 @@ pub fn build_extension() -> Extension {
         op_external_stylesheet_set(),
         op_external_stylesheet_remove(),
         op_external_stylesheet_get(),
+        op_stylesheet_generation(),
+        op_cssom_stylesheet_has(),
+        op_cssom_stylesheet_update(),
+        op_cssom_stylesheet_clear(),
         op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
@@ -6151,6 +6218,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_set_hovered());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
         ops.push(op_element_scroll_metrics());
@@ -6379,6 +6447,8 @@ fn document_base_href(state: &ObscuraState) -> Option<String> {
 pub struct BaseUrlCache {
     activity_generation: u64,
     document_generation: u64,
+    #[cfg(feature = "render")]
+    task_generation: u64,
     url: String,
     resolved: Option<String>,
     raw_href: Option<String>,
@@ -6400,6 +6470,8 @@ fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>
     *state.base_url_cache.borrow_mut() = Some(BaseUrlCache {
         activity_generation: state.activity_generation,
         document_generation: state.document_generation,
+        #[cfg(feature = "render")]
+        task_generation: state.animation_task_generation,
         url: state.url.clone(),
         resolved: resolved.clone(),
         raw_href: raw_href.clone(),
@@ -6420,6 +6492,14 @@ pub(crate) fn ensure_prepared_render(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
     let base_url = document_base_url(state);
+    ensure_prepared_render_with_base_url(state, base_url)
+}
+
+#[cfg(feature = "render")]
+fn ensure_prepared_render_with_base_url(
+    state: &mut ObscuraState,
+    base_url: Option<String>,
+) -> Option<&obscura_render::PreparedRender> {
     let viewport = state.viewport;
     let render_media = state.render_media;
     let animation_sample = state.animation_sample;
@@ -6504,13 +6584,25 @@ pub(crate) fn ensure_prepared_render(
     state.prepared_render.as_ref()
 }
 
+#[cfg(feature = "render")]
+fn document_base_url_for_javascript_task(state: &ObscuraState) -> Option<String> {
+    // CSSOM reads in one JS task share base resolution. Refresh next task
+    // as native DomTree edits need not increment the JS activity counter.
+    if state.base_url_cache.borrow().as_ref().is_some_and(|cached| {
+        cached.task_generation != state.animation_task_generation
+    }) {
+        *state.base_url_cache.borrow_mut() = None;
+    }
+    document_base_url_memoized(state)
+}
+
 /// Prepare enough state for a geometry-only CSSOM consumer. A forward sample
 /// with only paint effects may read the retained layout without resampling its
 /// styles. `animation_sample` on PreparedRender remains behind intentionally,
 /// making a later paint or computed-style consumer take the exact path above.
 #[cfg(feature = "render")]
 fn ensure_prepared_geometry(state: &mut ObscuraState) -> Option<&obscura_render::PreparedRender> {
-    let base_url = document_base_url(state);
+    let base_url = document_base_url_for_javascript_task(state);
     let reusable = state.pending_style_mutations.is_empty()
         && !state.animation_timeline.has_pending_start_candidates()
         && state.prepared_render.as_ref().is_some_and(|prepared| {
@@ -6522,7 +6614,7 @@ fn ensure_prepared_geometry(state: &mut ObscuraState) -> Option<&obscura_render:
     if reusable {
         return state.prepared_render.as_ref();
     }
-    ensure_prepared_render(state)
+    ensure_prepared_render_with_base_url(state, base_url)
 }
 
 #[cfg(feature = "render")]
@@ -7241,21 +7333,51 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
     serde_json::to_string(&measurements).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// One renderer-computed CSS snapshot for `getComputedStyle()`. Returning all
-/// supported properties together keeps a single JS style object to one native
-/// call and one use of the retained prepared layout.
+/// CSSOM snapshot and completeness flag. Non-geometric reads can resolve only
+/// the ancestor cascade while leaving layout damage pending for geometry/paint.
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
+fn op_computed_style(
+    state: &OpState,
+    #[string] nid_str: String,
+    #[string] pseudo: String,
+    #[string] property: String,
+) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
-    let Some(prepared) = ensure_prepared_render(&mut gs) else {
+    let base_url = document_base_url_for_javascript_task(&gs);
+    let needs_layout = gs.prepared_render.as_ref().is_none_or(|prepared| {
+        prepared.viewport() != gs.viewport || prepared.base_url() != base_url.as_deref()
+            || prepared.animation_sample() != gs.animation_sample
+    }) || !gs.pending_style_mutations.is_empty();
+    if pseudo.is_empty() && needs_layout && gs.animation_timeline.waapi_nodes().is_empty() {
+        if let Some(snapshot) = gs.dom.as_ref().and_then(|dom| {
+            obscura_render::dom::computed_style_without_layout(
+                dom, nid, gs.viewport, gs.render_media, &gs.stylesheet_cache, &property,
+            )
+        }) {
+            return serde_json::json!([false, snapshot]).to_string();
+        }
+    }
+    let Some(prepared) = ensure_prepared_render_with_base_url(&mut gs, base_url) else {
         return String::new();
     };
+    if matches!(pseudo.as_str(), ":before" | "::before" | ":after" | "::after") {
+        let Some((content, display)) =
+            prepared.computed_pseudo_content(nid, pseudo.ends_with("before"))
+        else {
+            return String::new();
+        };
+        let content = content.map_or_else(
+            || "none".to_string(),
+            |value| serde_json::to_string(value).unwrap_or_else(|_| "none".to_string()),
+        );
+        return serde_json::json!([true, { "content": content, "display": display }]).to_string();
+    }
     let Some(snapshot) = prepared.computed_style(nid) else {
         return String::new();
     };
@@ -7267,7 +7389,23 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
     for (name, value) in custom {
         object.insert(name, serde_json::Value::String(value));
     }
-    serde_json::Value::Object(object).to_string()
+    serde_json::json!([true, object]).to_string()
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let changed = state.dom.as_ref().is_some_and(|dom| {
+        dom.set_hovered((nid != 0).then(|| NodeId::new(nid)))
+    });
+    if changed {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        state.prepared_render = None;
+        state.pending_style_mutations.clear();
+        state.resolved_scroll = None;
+    }
 }
 
 /// Use the renderer's declaration parser as the single feature-query source

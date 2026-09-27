@@ -677,7 +677,6 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Page.getFrameTree"
             | "Page.setDownloadBehavior"
             | "Page.setLifecycleEventsEnabled"
-            | "Page.addScriptToEvaluateOnNewDocument"
             | "Page.removeScriptToEvaluateOnNewDocument"
             | "Page.setInterceptFileChooserDialog"
             | "Page.getNavigationHistory"
@@ -818,13 +817,10 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     #[cfg(feature = "render")]
-    if result.is_ok() && domains::page::command_can_change_screencast_frame(&req.method) {
-        if let Err(error) = domains::page::queue_screencast_frame(ctx, &req.session_id, false) {
-            // Frame delivery is an asynchronous side effect in Chromium; it
-            // must not rewrite an otherwise successful command response.
-            tracing::warn!(method = %req.method,
-                "could not produce command-driven screencast frame: {error}");
-        }
+    if result.is_ok()
+        && domains::page::command_can_change_screencast_frame(&req.method)
+    {
+        domains::page::schedule_screencast_frame(ctx, &req.session_id);
     }
 
     // Stop the per-command watchdog. If it fired (the handler held V8 past the
@@ -1224,6 +1220,83 @@ mod tests {
         assert!(err.message.contains("Unknown domain"));
     }
 
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_runtime_calls_do_not_force_screencast_frames() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let start = CdpRequest {
+            id: 2,
+            method: "Page.startScreencast".into(),
+            params: json!({}),
+            session_id: Some(session_id.clone()),
+        };
+        let response = dispatch(&start, &mut ctx).await;
+        assert!(response.error.is_none(), "start failed: {:?}", response.error);
+        ctx.pending_events.clear();
+
+        let evaluate = CdpRequest {
+            id: 3,
+            method: "Runtime.evaluate".into(),
+            params: json!({"expression": "document.title", "returnByValue": true}),
+            session_id: Some(session_id),
+        };
+        let response = dispatch(&evaluate, &mut ctx).await;
+        assert!(response.error.is_none(), "evaluate failed: {:?}", response.error);
+        assert!(
+            ctx.pending_events
+                .iter()
+                .all(|event| event.method != "Page.screencastFrame"),
+            "a read-only runtime call must not synchronously rasterize a frame"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutating_commands_schedule_screencast_after_the_command_response() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id.clone());
+
+        let response = dispatch(
+            &CdpRequest {
+                id: 2,
+                method: "Page.startScreencast".into(),
+                params: json!({}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "start failed: {:?}", response.error);
+        ctx.pending_events.clear();
+
+        let response = dispatch(
+            &CdpRequest {
+                id: 3,
+                method: "Emulation.setDefaultBackgroundColorOverride".into(),
+                params: json!({"color": {"r": 20, "g": 40, "b": 60}}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "override failed: {:?}", response.error);
+        assert!(ctx.pending_events.is_empty(), "frame must not delay the command response");
+        assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
+
+        crate::domains::page::pump_screencast_frames(&mut ctx).await;
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.screencastFrame"));
+    }
+
     #[tokio::test]
     async fn send_message_to_target_unwraps_inner_call() {
         let mut ctx = CdpContext::new();
@@ -1289,4 +1362,5 @@ mod tests {
         let err = resp.error.expect("malformed inner messages must error");
         assert_eq!(err.code, -32700);
     }
+
 }

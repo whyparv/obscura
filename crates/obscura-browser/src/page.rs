@@ -175,6 +175,8 @@ fn navigation_referrer(source: &Url, target: &Url) -> String {
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
     pub request_id: String,
+    /// The live interception channel already emitted the request start.
+    pub intercepted: bool,
     pub url: String,
     pub method: String,
     pub resource_type: String,
@@ -225,6 +227,13 @@ impl PendingFrameWork {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingNavigationOutcome {
+    None,
+    Document,
+    SameDocument,
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
@@ -250,6 +259,7 @@ pub struct Page {
     /// viewport and survives navigation, matching device-metrics emulation.
     screen_size_override: Option<(f32, f32)>,
     screen_metrics_emulated: bool,
+    locale_override: Option<String>,
     /// Metrics captured when CDP device emulation is first enabled. Chromium
     /// keeps this baseline across subsequent override calls and restores it
     /// only when the override is cleared.
@@ -1098,6 +1108,7 @@ impl Page {
             viewport: (1280.0, 720.0),
             screen_size_override: None,
             screen_metrics_emulated: false,
+            locale_override: None,
             device_metrics_baseline: None,
             device_scale_factor: 1.0,
             default_background_color_override: None,
@@ -1154,19 +1165,9 @@ impl Page {
     }
 
     fn should_block_url(&self, url: &str) -> bool {
-        for pattern in &self.blocked_url_patterns {
-            if url_matches_cdp_pattern(pattern, url) {
-                return true;
-            }
-        }
-        if self.intercept_enabled {
-            for pattern in &self.intercept_block_patterns {
-                if url_matches_cdp_pattern(pattern, url) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.blocked_url_patterns
+            .iter()
+            .any(|pattern| url_matches_cdp_pattern(pattern, url))
     }
 
     /// Moves fetched frame documents into Page ownership without doing work
@@ -1640,6 +1641,13 @@ impl Page {
         }
     }
 
+    pub fn set_locale_override(&mut self, locale: Option<String>) {
+        self.locale_override = locale.filter(|locale| !locale.is_empty());
+        if let Some(js) = &mut self.js {
+            js.set_locale(self.locale_override.as_deref().unwrap_or("en-US"));
+        }
+    }
+
     /// Apply CDP device metrics relative to the metrics that were active when
     /// emulation was first enabled. A zero protocol dimension/scale is passed
     /// as `None` and therefore restores that axis from the retained baseline.
@@ -1790,6 +1798,9 @@ impl Page {
                 &self.context.ua_platform_version,
             );
         }
+        if let Some(locale) = &self.locale_override {
+            rt.set_locale(locale);
+        }
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }
@@ -1809,6 +1820,7 @@ impl Page {
             rt.set_stealth_client(stealth.clone());
         }
 
+        rt.set_intercept_page_id(&self.id);
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
         }
@@ -2930,9 +2942,6 @@ impl Page {
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  try {\n\
                    const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
-                   if (typeof window.onload === 'function') {\n\
-                     try { window.onload.call(window, loadEvent); } catch(e) {}\n\
-                   }\n\
                    try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
                  } catch(e) {}",
             );
@@ -4047,6 +4056,28 @@ impl Page {
         js.screenshot_prepared_region_with_surface_color(region, self.capture_surface_color())
     }
 
+    #[cfg(feature = "render")]
+    pub fn screenshot_region_raster_with_animation_sample(
+        &self,
+        region: obscura_js::CaptureRegion,
+        animation_sample: obscura_js::AnimationSample,
+    ) -> Result<image::RgbaImage, obscura_js::CaptureError> {
+        let js = self
+            .js
+            .as_ref()
+            .ok_or(obscura_js::CaptureError::PaintFailed)?;
+        if !js.set_animation_sample(animation_sample) {
+            return Err(obscura_js::CaptureError::PaintFailed);
+        }
+        let (width, height, pixels) = js
+            .screenshot_prepared_region_raster_with_surface_color(
+                region,
+                self.capture_surface_color(),
+            )?;
+        image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or(obscura_js::CaptureError::PaintFailed)
+    }
+
     /// Scrollable document dimensions from the retained render layout. Unlike
     /// DOM properties evaluated in page JavaScript, this cannot be shadowed or
     /// monkey-patched by the document being captured.
@@ -4130,6 +4161,7 @@ impl Page {
         for ev in events {
             self.network_events.push(NetworkEvent {
                 request_id: ev.request_id,
+                intercepted: ev.intercepted,
                 url: ev.url,
                 method: ev.method,
                 resource_type: "Fetch".to_string(),
@@ -4227,6 +4259,7 @@ impl Page {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
                     obscura_js::runtime::RemoteObjectInfo {
                         thrown: false,
+                        unserializable_value: None,
                         js_type: "undefined".into(),
                         subtype: None,
                         class_name: String::new(),
@@ -4240,6 +4273,7 @@ impl Page {
             let val = self.evaluate(expression);
             obscura_js::runtime::RemoteObjectInfo {
                 thrown: false,
+                unserializable_value: None,
                 js_type: match &val {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -4274,6 +4308,7 @@ impl Page {
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
                 thrown: false,
+                unserializable_value: None,
                 js_type: match &value {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -4313,6 +4348,7 @@ impl Page {
                     tracing::debug!("callFunctionOn error: {}", e);
                     obscura_js::runtime::RemoteObjectInfo {
                         thrown: false,
+                        unserializable_value: None,
                         js_type: "undefined".into(),
                         subtype: None,
                         class_name: String::new(),
@@ -4325,6 +4361,7 @@ impl Page {
         } else {
             obscura_js::runtime::RemoteObjectInfo {
                 thrown: false,
+                unserializable_value: None,
                 js_type: "undefined".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -4426,6 +4463,7 @@ impl Page {
             .as_secs_f64();
         self.network_events.push(NetworkEvent {
             request_id: request_id.clone(),
+            intercepted: false,
             url: url.to_string(),
             method: method.to_string(),
             resource_type: resource_type.to_string(),
@@ -4705,6 +4743,36 @@ impl Page {
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
+        Ok(self.process_pending_navigation_outcome().await? != PendingNavigationOutcome::None)
+    }
+
+    /// Reject a document-driven cross-scheme jump to `file://` and restore
+    /// the virtual URL that the location setter changed before queuing it.
+    pub fn reject_page_initiated_file_navigation(&mut self, target: &str) -> bool {
+        let current_url = self.url_string();
+        if !cross_scheme_to_file(&current_url, target) {
+            return false;
+        }
+        tracing::warn!(
+            "blocking page-initiated cross-scheme navigation to file: {} -> {}",
+            current_url,
+            target,
+        );
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script(
+                "<blocked-navigation>",
+                &format!(
+                    "globalThis.__virtualUrl = {};",
+                    serde_json::to_string(&current_url).unwrap_or_else(|_| "null".into())
+                ),
+            );
+        }
+        true
+    }
+
+    pub async fn process_pending_navigation_outcome(
+        &mut self,
+    ) -> Result<PendingNavigationOutcome, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
             // SOP gate for navigations the page queued itself (a timer or
             // handler assigning location, a link click, a form submit). They
@@ -4712,61 +4780,46 @@ impl Page {
             // navigate_with_wait_post_inner never sees them. A web document
             // must not drive itself into file:// even in a context that lets
             // clients open local files (#1069).
-            let current_url = self.url_string();
-            if cross_scheme_to_file(&current_url, &url) {
-                tracing::warn!(
-                    "blocking page-initiated cross-scheme navigation to file: {} -> {}",
-                    current_url,
-                    url,
-                );
-                // The location setter already published the target as the
-                // virtual URL; put location back on the document that is
-                // still loaded so nothing later adopts the blocked target.
-                if let Some(js) = self.js.as_mut() {
-                    let _ = js.execute_script(
-                        "<blocked-navigation>",
-                        &format!(
-                            "globalThis.__virtualUrl = {};",
-                            serde_json::to_string(&current_url).unwrap_or_else(|_| "null".into())
-                        ),
-                    );
-                }
-                return Ok(false);
+            if self.reject_page_initiated_file_navigation(&url) {
+                return Ok(PendingNavigationOutcome::None);
             }
-            let source_url = self
-                .url
-                .as_ref()
-                .and_then(|source| {
-                    Url::parse(&url)
-                        .ok()
-                        .map(|target| navigation_referrer(source, &target))
-                })
-                .unwrap_or_default();
-            let nav_timeout = self.navigation_timeout();
-            let nav_timeout_ms = duration_millis_u64(nav_timeout);
-            let result = tokio::time::timeout(
-                nav_timeout,
-                self.navigate_with_wait_post_inner(
-                    &url,
-                    crate::lifecycle::WaitUntil::Load,
-                    &method,
-                    &body,
-                    &source_url,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
-            })?;
-            result?;
-            self.push_history(self.url_string());
-            Ok(true)
+            self.navigate_from_document(&url, &method, &body).await?;
+            Ok(PendingNavigationOutcome::Document)
         } else {
             // Fork: a page that routed itself through history has still
             // navigated. See fork_virtual_url.rs.
-            Ok(self.sync_virtual_url())
+            Ok(if self.sync_virtual_url() {
+                PendingNavigationOutcome::SameDocument
+            } else {
+                PendingNavigationOutcome::None
+            })
         }
+    }
+
+    /// Follow an in-document navigation, retaining its referrer and deadline
+    /// even when an embedder services intercepted requests outside dispatch.
+    pub async fn navigate_from_document(
+        &mut self,
+        url: &str,
+        method: &str,
+        body: &str,
+    ) -> Result<(), PageError> {
+        let source_url = self.url.as_ref().and_then(|source| {
+            Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
+        }).unwrap_or_default();
+        let nav_timeout = self.navigation_timeout();
+        let nav_timeout_ms = duration_millis_u64(nav_timeout);
+        tokio::time::timeout(
+            nav_timeout,
+            self.navigate_with_wait_post_inner(
+                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url,
+            ),
+        ).await.map_err(|_| {
+            self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+            PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
+        })??;
+        self.push_history(self.url_string());
+        Ok(())
     }
 
     pub fn set_intercept_tx(
@@ -5547,9 +5600,10 @@ mod tests {
             true,
         ));
         let mut page = super::Page::new("stylesheet-graph".to_string(), context);
-        page.set_blocked_urls(vec!["*blocked.css".to_string()]);
-        page.intercept_block_patterns = vec!["*intercepted.css".to_string()];
-        page.enable_intercept(true);
+        page.set_blocked_urls(vec![
+            "*blocked.css".to_string(),
+            "*intercepted.css".to_string(),
+        ]);
 
         let request_count = std::sync::Arc::new(AtomicUsize::new(0));
         let response_count = std::sync::Arc::new(AtomicUsize::new(0));
@@ -6058,6 +6112,34 @@ mod tests {
             serde_json::json!(24.0),
         );
         assert_eq!(script_requests.load(Ordering::SeqCst), 24);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_interception_patterns_do_not_block_parser_scripts() {
+        let (url, _) = spawn_script_resource_cache_server(false);
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "fetch-pattern-is-not-blocklist".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("fetch-pattern-is-not-blocklist".to_string(), context);
+        page.intercept_block_patterns = vec!["*".to_string()];
+        page.enable_intercept(true);
+
+        page.navigate(&url).await.unwrap();
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__runs")
+                .unwrap(),
+            serde_json::json!(32.0),
+            "Fetch.enable patterns pause matching requests; they are not blocked URLs",
+        );
     }
 
     #[test]
@@ -6752,6 +6834,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("1"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_release_cannot_delete_a_new_document_handle() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "cdp-handle-navigation".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("cdp-handle-navigation".to_string(), context);
+        page.url = Some(url::Url::parse("http://example.com/old.html").unwrap());
+        page.dom = Some(parse_html("<html><body></body></html>"));
+        page.init_js();
+        let old_id = page
+            .evaluate_for_cdp_with_timeout("({ marker: 1 })", false, false, 1_000)
+            .await
+            .unwrap()
+            .object_id
+            .unwrap();
+
+        page.navigate_blank();
+        page.init_js();
+        let new_id = page
+            .evaluate_for_cdp_with_timeout("({ marker: 2 })", false, false, 1_000)
+            .await
+            .unwrap()
+            .object_id
+            .unwrap();
+
+        assert_ne!(old_id, new_id, "remote object IDs must not repeat across documents");
+        page.release_object(&old_id);
+        let result = page
+            .call_function_on_for_cdp_with_timeout(
+                "function() { return this.marker; }",
+                Some(&new_id),
+                &[],
+                true,
+                false,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(2.0)));
     }
 
     fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
@@ -8560,12 +8688,12 @@ mod tests {
         );
     }
 
-    /// Renderer misses follow the page's `Fetch.enable` interception policy
-    /// like the warmup scan: an intercepted URL is not fetched behind the
-    /// client's back, other URLs still load.
+    /// Fetch.enable patterns are not renderer block rules. Playwright enables
+    /// Fetch with `*` and filters routes client-side, so treating those patterns
+    /// as blocked URLs would remove every image and font from the page.
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
-    async fn renderer_misses_honour_fetch_interception_patterns() {
+    async fn renderer_misses_ignore_fetch_interception_patterns() {
         let (address, _peak, _open, seen_rx) = spawn_counting_svg_server(0, 6);
         let page_url = format!("http://{address}/page");
         let intercepted = format!("http://{address}/intercepted.ttf");
@@ -8588,15 +8716,15 @@ mod tests {
             .evaluate("document.getElementById('a').getBoundingClientRect().width + document.getElementById('b').getBoundingClientRect().width")
             .unwrap();
         page.queue_pending_render_resources();
-        assert!(page.prepare_screenshot_resources(3_000).await <= 1);
+        assert_eq!(page.prepare_screenshot_resources(3_000).await, 2);
         assert!(!page.has_pending_render_resources());
         let mut lines = Vec::new();
         while let Ok(line) = seen_rx.try_recv() {
             lines.push(line);
         }
         assert!(
-            lines.iter().all(|line| !line.contains("/intercepted.ttf")),
-            "an intercepted URL must not be fetched: {lines:?}"
+            lines.iter().any(|line| line.starts_with("GET /intercepted.ttf ")),
+            "Fetch patterns must not block static resources: {lines:?}"
         );
         assert!(
             lines.iter().any(|line| line.starts_with("GET /plain.ttf ")),
@@ -8605,28 +8733,6 @@ mod tests {
         let js = page.js.as_ref().unwrap();
         assert!(js.render_resource_is_known(&intercepted), "intercepted URL is settled as missing");
         assert!(js.render_resource_is_known(&plain));
-        // Disabling interception lifts the rule for later misses.
-        page.intercept_block_patterns.clear();
-        page.enable_intercept(false);
-        let late = format!("http://{address}/late-intercepted.ttf");
-        page.js
-            .as_mut()
-            .unwrap()
-            .evaluate(&format!(
-                r#"(function() {{
-                    document.fonts.add(new FontFace('C', 'url({late})'));
-                    const a = document.getElementById('a');
-                    a.style.fontFamily = 'C';
-                    return a.getBoundingClientRect().width;
-                }})()"#
-            ))
-            .unwrap();
-        page.queue_pending_render_resources();
-        page.prepare_screenshot_resources(3_000).await;
-        assert!(
-            seen_rx.try_iter().any(|line| line.starts_with("GET /late-intercepted.ttf ")),
-            "without interception the URL loads"
-        );
     }
 
     #[cfg(feature = "render")]

@@ -238,16 +238,19 @@ pub async fn handle(
             Ok(json!({ "success": true }))
         }
         "setAutoAttach" => Ok(json!({})),
-        // No multi-target lifecycle to manage: obscura runs one page per session.
-        // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                let page_id = ctx.sessions.get(session_id).cloned();
-                ctx.sessions.remove(session_id);
+                let page_id = ctx.sessions.remove(session_id);
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
                     ctx.refresh_runtime_event_collection(&page_id);
+                    let params = json!({"sessionId": session_id, "targetId": page_id});
+                    let event = match parent_session_id {
+                        Some(parent) => CdpEvent::with_session("Target.detachedFromTarget", params, parent.clone()),
+                        None => CdpEvent::new("Target.detachedFromTarget", params),
+                    };
+                    ctx.pending_events.push(event);
                 }
                 #[cfg(feature = "render")]
                 ctx.screencasts.remove(session_id);
@@ -482,6 +485,7 @@ mod tests {
         .await
         .unwrap();
         let session_id = attached["sessionId"].as_str().unwrap().to_string();
+        ctx.pending_events.clear();
 
         handle(
             "detachFromTarget",
@@ -492,6 +496,13 @@ mod tests {
         .await
         .expect("detach should succeed");
         assert!(!ctx.sessions.contains_key(&session_id));
+        assert!(ctx.get_page(&page_id).is_some(), "detach must not destroy the target");
+        assert_eq!(ctx.pending_events.len(), 1);
+        let event = &ctx.pending_events[0];
+        assert_eq!(event.method, "Target.detachedFromTarget");
+        assert_eq!(event.session_id, parent_session);
+        assert_eq!(event.params["sessionId"], session_id);
+        assert_eq!(event.params["targetId"], page_id);
     }
 
     #[tokio::test]

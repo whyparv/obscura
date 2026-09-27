@@ -505,6 +505,33 @@ pub(crate) fn split_declarations(css: &str) -> Vec<&str> {
     parts
 }
 
+fn parse_containment(value: &str) -> Option<u8> {
+    use crate::{CONTAIN_SIZE, CONTAIN_INLINE_SIZE, CONTAIN_LAYOUT, CONTAIN_STYLE, CONTAIN_PAINT};
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "none" | "initial" | "unset" | "revert" | "revert-layer" => return Some(0),
+        "inherit" => return Some(crate::CONTAIN_INHERIT),
+        "strict" => return Some(CONTAIN_SIZE | CONTAIN_LAYOUT | CONTAIN_STYLE | CONTAIN_PAINT),
+        "content" => return Some(CONTAIN_LAYOUT | CONTAIN_STYLE | CONTAIN_PAINT),
+        _ => {}
+    }
+    let mut flags = 0;
+    for token in value.split_ascii_whitespace() {
+        let flag = match token {
+            "size" => CONTAIN_SIZE,
+            "inline-size" => CONTAIN_INLINE_SIZE,
+            "layout" => CONTAIN_LAYOUT,
+            "style" => CONTAIN_STYLE,
+            "paint" => CONTAIN_PAINT,
+            _ => return None,
+        };
+        if flags & flag != 0 { return None; }
+        flags |= flag;
+    }
+    (flags != 0 && flags & (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)
+        != (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)).then_some(flags)
+}
+
 fn parse_container_type(value: &str) -> Option<crate::ContainerType> {
     match value.trim().to_ascii_lowercase().as_str() {
         "normal" => Some(crate::ContainerType::Normal),
@@ -1862,13 +1889,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             non_none_value(value),
         ),
         "contain" => {
-            let establishes = value.split_whitespace().any(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "layout" | "paint" | "strict" | "content"
-                )
-            });
-            set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN, establishes);
+            if let Some(flags) = parse_containment(value) {
+                style.containment = flags;
+                set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN,
+                    flags & (crate::CONTAIN_LAYOUT | crate::CONTAIN_PAINT) != 0);
+            }
         }
         "will-change" => {
             let establishes = value.split([',', ' ']).map(str::trim).any(|v| {

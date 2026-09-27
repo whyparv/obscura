@@ -354,9 +354,10 @@ impl<'a> Element for DomElement<'a> {
     fn prev_sibling_element(&self) -> Option<Self> {
         let mut current = self.tree.with_node(self.node_id, |node| node.prev_sibling)?;
         while let Some(sibling_id) = current {
-            let (element, previous) = self.tree.with_node(sibling_id,
-                |sibling| (sibling.is_element(), sibling.prev_sibling))?;
-            if element {
+            let (is_element, previous) = self.tree.with_node(sibling_id, |sibling| {
+                (sibling.is_element(), sibling.prev_sibling)
+            })?;
+            if is_element {
                 return Some(DomElement::new(self.tree, sibling_id));
             }
             current = previous;
@@ -367,9 +368,10 @@ impl<'a> Element for DomElement<'a> {
     fn next_sibling_element(&self) -> Option<Self> {
         let mut current = self.tree.with_node(self.node_id, |node| node.next_sibling)?;
         while let Some(sibling_id) = current {
-            let (element, next) = self.tree.with_node(sibling_id,
-                |sibling| (sibling.is_element(), sibling.next_sibling))?;
-            if element {
+            let (is_element, next) = self.tree.with_node(sibling_id, |sibling| {
+                (sibling.is_element(), sibling.next_sibling)
+            })?;
+            if is_element {
                 return Some(DomElement::new(self.tree, sibling_id));
             }
             current = next;
@@ -380,9 +382,10 @@ impl<'a> Element for DomElement<'a> {
     fn first_element_child(&self) -> Option<Self> {
         let mut current = self.tree.with_node(self.node_id, |node| node.first_child)?;
         while let Some(child_id) = current {
-            let (element, next) = self.tree.with_node(child_id,
-                |child| (child.is_element(), child.next_sibling))?;
-            if element {
+            let (is_element, next) = self.tree.with_node(child_id, |child| {
+                (child.is_element(), child.next_sibling)
+            })?;
+            if is_element {
                 return Some(DomElement::new(self.tree, child_id));
             }
             current = next;
@@ -502,10 +505,9 @@ impl<'a> Element for DomElement<'a> {
                     .form_control_checked(self.node_id)
                     .unwrap_or_else(|| self.has_boolean_attr("checked") || self.has_boolean_attr("selected"))
             }
-            // Dynamic user-interaction pseudo-classes have no meaning against
-            // a static DOM snapshot with no live user input.
-            PseudoClass::Hover
-            | PseudoClass::Active
+            PseudoClass::Hover => self.tree.is_hovered(self.node_id),
+            // These dynamic states are not tracked yet.
+            PseudoClass::Active
             | PseudoClass::Focus
             | PseudoClass::FocusVisible
             | PseudoClass::FocusWithin => false,
@@ -586,13 +588,18 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |node| {
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
-                    if let Some(child_node) = self.tree.get_node(child_id) {
-                        match &child_node.data {
-                            NodeData::Element { .. } => return false,
-                            NodeData::Text { contents } if !contents.is_empty() => return false,
-                            _ => {}
+                    if let Some((nonempty, next)) = self.tree.with_node(child_id, |child| {
+                        let nonempty = match &child.data {
+                            NodeData::Element { .. } => true,
+                            NodeData::Text { contents } => !contents.is_empty(),
+                            _ => false,
+                        };
+                        (nonempty, child.next_sibling)
+                    }) {
+                        if nonempty {
+                            return false;
                         }
-                        child = child_node.next_sibling;
+                        child = next;
                     } else {
                         break;
                     }

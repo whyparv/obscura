@@ -61,7 +61,9 @@ const __obscuraCore = globalThis.Deno.core;
     'Navigator', 'PluginArray', 'Plugin', 'MimeType', 'MimeTypeArray',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
+    'CSSStyleDeclaration', 'CSSRule', 'CSSStyleRule', 'CSSGroupingRule',
+    'CSSRuleList', 'StyleSheet', 'StyleSheetList', 'CSSStyleSheet',
+    'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
@@ -1917,6 +1919,15 @@ function _eventTargetDispatch(target, event) {
   event.currentTarget = target;
   event.eventPhase = 2;
   try {
+    // Other EventTargets register their IDL handlers in the listener list.
+    const eventHandler = target === globalThis ? target['on' + event.type] : null;
+    if (typeof eventHandler === 'function') {
+      try {
+        if (eventHandler.call(target, event) === false) event.preventDefault();
+      } catch (error) {
+        console.error(error);
+      }
+    }
     const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
     for (const entry of listeners) {
       const current = _eventTargetListeners.get(target)?.get(String(event.type));
@@ -4360,6 +4371,26 @@ class Element extends Node {
       configurable: true
     });
   }
+  get label() {
+    if (this.localName === 'option') {
+      const label = this.getAttribute('label');
+      return label !== null ? label : this.textContent;
+    }
+    if (this.localName === 'optgroup') return this.getAttribute('label') || '';
+    return undefined;
+  }
+  set label(v) {
+    if (this.localName === 'option' || this.localName === 'optgroup') {
+      this.setAttribute('label', String(v));
+      return;
+    }
+    Object.defineProperty(this, 'label', {
+      value: v,
+      writable: true,
+      enumerable: true,
+      configurable: true
+    });
+  }
   get disabled() { return this.hasAttribute("disabled"); }
   set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
   get type() {
@@ -6749,7 +6780,13 @@ function _elementClassFor(nid) {
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "INPUT" && globalThis.HTMLInputElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
+      && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+  if (tag === "META" && globalThis.HTMLMetaElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
+      && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
   // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
   // (createElementNS + cloneNode lands here) stays a plain Element.
   if (tag === "SLOT" && globalThis.HTMLSlotElement
@@ -6775,7 +6812,9 @@ function _elementClassForKnownName(namespace, qualifiedName) {
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+    if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+    if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
@@ -7242,8 +7281,12 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
-  defGetter('language', function() { return "en-US"; });
-  defGetter('languages', function() { return ["en-US", "en"]; });
+  defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
+  defGetter('languages', function() {
+    const language = globalThis.__obscura_language || "en-US";
+    const base = language.split('-')[0];
+    return base !== language ? [language, base] : [language];
+  });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
   var _plugins = new PluginArray([
@@ -8695,28 +8738,32 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
 // getComputedStyle() repeatedly on the same few roots; rebuilding and parsing
 // several hundred properties for every wrapper dominated real-page startup.
 const _computedStyleSnapshotCache = new WeakMap();
-globalThis.getComputedStyle = (el) => {
+globalThis.getComputedStyle = (el, pseudo = '') => {
   if (!el) el = document.body || {};
+  pseudo = String(pseudo || '').toLowerCase();
   const style = el?.style || el?._style || new CSSStyleDeclaration();
   // Render builds expose one immutable snapshot from the retained final
   // cascade/layout. The native snapshot is shared per element and epoch while
   // each call still returns a distinct, live CSSStyleDeclaration proxy.
   const cacheable = (typeof el === 'object' && el !== null) || typeof el === 'function';
-  let snapshot = cacheable ? _computedStyleSnapshotCache.get(el) : null;
+  let snapshot = !pseudo && cacheable ? _computedStyleSnapshotCache.get(el) : null;
   if (!snapshot) {
-    snapshot = { rendered: null, epoch: -1, names: [] };
-    if (cacheable) _computedStyleSnapshotCache.set(el, snapshot);
+    snapshot = { rendered: null, epoch: -1, names: [], complete: false };
+    if (!pseudo && cacheable) _computedStyleSnapshotCache.set(el, snapshot);
   }
-  const refreshRendered = () => {
+  const refreshRendered = (property = '') => {
     const hasRunningAnimation = typeof _animationsForTarget === 'function'
       && _animationsForTarget(el).some(animation => animation.playState === 'running');
-    if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation) return;
+    if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation
+        && (snapshot.complete || (property && snapshot.rendered
+            && Object.prototype.hasOwnProperty.call(snapshot.rendered, property)))) return;
     snapshot.epoch = _domMutationEpoch;
     snapshot.rendered = null;
+    snapshot.complete = true;
     if (typeof __obscuraCore.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0));
-        snapshot.rendered = raw ? JSON.parse(raw) : null;
+        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0), pseudo, property);
+        if (raw) [snapshot.complete, snapshot.rendered] = JSON.parse(raw);
       } catch (e) {}
     }
     snapshot.names = snapshot.rendered ? Object.keys(snapshot.rendered) : [];
@@ -8777,13 +8824,13 @@ globalThis.getComputedStyle = (el) => {
 
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
-    refreshRendered();
     let kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
     // CSSOM camelCase vendor properties omit the punctuation from their JS
     // spelling (`webkitLineClamp`) but computed-property names retain it
     // (`-webkit-line-clamp`). Normalize the prefix once for every WebKit
     // property instead of adding per-property aliases to the native snapshot.
     if (kebab.startsWith('webkit-')) kebab = '-' + kebab;
+    refreshRendered(kebab);
     if (snapshot.rendered && Object.prototype.hasOwnProperty.call(snapshot.rendered, kebab))
       return snapshot.rendered[kebab];
     // Non-render builds and properties outside the renderer snapshot retain
@@ -9014,10 +9061,44 @@ class CSSRuleList {
 
 const _cssStyleSheetPrivate = new WeakMap();
 
-class CSSStyleSheet {
+class CSSGroupingRule extends CSSRule {
+  constructor(cssText = "", type = 0) {
+    super(cssText, type);
+    this._rules = [];
+    this._cssRules = new CSSRuleList(this);
+  }
+  _refreshFromOwner() {}
+  get cssRules() { return this._cssRules; }
+  insertRule(rule, index = 0) {
+    const idx = Number(index) >>> 0;
+    if (idx > this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
+    const parsed = _splitTopLevelCssRules(String(rule));
+    if (!parsed.valid || parsed.rules.length !== 1) throw new DOMException("The rule could not be parsed", "SyntaxError");
+    const child = _cssRuleFromText(parsed.rules[0]);
+    if (!child) throw new DOMException("The rule could not be parsed", "SyntaxError");
+    child._parentStyleSheet = this.parentStyleSheet;
+    this._rules.splice(idx, 0, child);
+    this.parentStyleSheet?._ruleChanged();
+    return idx;
+  }
+  deleteRule(index) {
+    const idx = Number(index) >>> 0;
+    if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
+    this._rules.splice(idx, 1);
+    this.parentStyleSheet?._ruleChanged();
+  }
+}
+
+class StyleSheet {
+  constructor() { this._disabled = false; }
+  get disabled() { return this._disabled; }
+  set disabled(value) { this._disabled = !!value; }
+}
+
+class CSSStyleSheet extends StyleSheet {
   constructor(_options) {
+    super();
     this.ownerRule = null;
-    this.disabled = false;
     this._ownerNode = null;
     this._sourceNode = null;
     this._sourceText = "";
@@ -9031,6 +9112,8 @@ class CSSStyleSheet {
       href: null,
       originClean: true,
       sourceText: "",
+      generation: -1,
+      cssom: false,
     });
   }
   get type() { return "text/css"; }
@@ -9050,6 +9133,8 @@ class CSSStyleSheet {
     state.href = null;
     state.originClean = true;
     state.sourceText = "";
+    state.generation = -1;
+    state.cssom = false;
     this._ownerNode = ownerNode;
     this._sourceNode = sourceNode;
     this._sourceText = null;
@@ -9061,6 +9146,8 @@ class CSSStyleSheet {
     state.href = href || null;
     state.originClean = false;
     state.sourceText = "";
+    state.generation = -1;
+    state.cssom = false;
     this._ownerNode = ownerNode;
     this._sourceNode = null;
     this._sourceText = "";
@@ -9076,10 +9163,14 @@ class CSSStyleSheet {
   }
   _refreshFromOwner() {
     const state = _cssStyleSheetPrivate.get(this);
-    if (!state) return;
+    if (!state || !(state.linked ? this._ownerNode : this._sourceNode)) return;
+    // Tracing iterates every rule. Copying the source for each item is O(n²).
+    // The host generations include native imports and their origin-clean state.
+    const generation = __obscuraCore.ops.op_stylesheet_generation(_realmFrameId, state.linked);
+    if (state.generation === generation) return;
+    state.generation = generation;
     let text;
     if (state.linked) {
-      if (!this._ownerNode) return;
       let loaded;
       try {
         loaded = JSON.parse(__obscuraCore.ops.op_external_stylesheet_get(
@@ -9096,10 +9187,11 @@ class CSSStyleSheet {
       }
       text = String(loaded.css || "");
     } else {
-      if (!this._sourceNode) return;
       text = this._sourceNode.textContent || "";
     }
-    if (text === state.sourceText) return;
+    if (text === state.sourceText && (!state.cssom ||
+        __obscuraCore.ops.op_cssom_stylesheet_has(this._ownerNode._nid, _realmFrameId))) return;
+    state.cssom = false;
     const parsed = _splitTopLevelCssRules(text);
     const rules = parsed.rules.map(_cssRuleFromText).filter(Boolean);
     this._setRules(rules);
@@ -9112,23 +9204,34 @@ class CSSStyleSheet {
     for (const rule of this._rules) rule._parentStyleSheet = this;
   }
   _serializeText() { return this._rules.map(rule => rule.cssText).join("\n"); }
-  _ruleChanged() {
-    const text = this._serializeText();
+  _ruleChanged(change) {
     const state = _cssStyleSheetPrivate.get(this);
-    if (state) state.sourceText = text;
-    this._sourceText = text;
     if (state?.linked && this._ownerNode) {
+      // ponytail: linked imports retain the existing whole-sheet write path;
+      // incremental writes need per-sheet host-import revision tracking.
+      const text = this._serializeText();
+      state.sourceText = text;
+      this._sourceText = text;
       __obscuraCore.ops.op_external_stylesheet_set(
-        this._ownerNode._nid,
-        text,
+        this._ownerNode._nid, text,
         state.href || globalThis.document?.URL || "about:blank",
-        true,
-        globalThis.__obscura_frameId || 0,
+        true, _realmFrameId,
       );
-    } else if (this._sourceNode && this._sourceNode.textContent !== text) {
-      this._sourceNode.textContent = text;
+    } else if (this._ownerNode) {
+      // Initialize once, then transfer just the inserted/deleted rules. DOM
+      // source remains unchanged, including its text nodes and observers.
+      const reset = !state.cssom || !change;
+      state.cssom = __obscuraCore.ops.op_cssom_stylesheet_update(
+        this._ownerNode._nid, reset ? 0 : change.index,
+        reset ? 0 : change.deleteCount,
+        reset ? this._rules.map(rule => rule.cssText) : change.rules,
+        reset, _realmFrameId,
+      );
     }
     _syncAdoptedStyleSheet(this);
+    if (state && (state.linked || this._sourceNode)) {
+      state.generation = __obscuraCore.ops.op_stylesheet_generation(_realmFrameId, state.linked);
+    }
   }
   insertRule(rule, index = 0) {
     if (arguments.length < 1) throw new TypeError("CSSStyleSheet.insertRule requires a rule");
@@ -9144,7 +9247,7 @@ class CSSStyleSheet {
     if (!cssRule) throw new DOMException("The rule could not be parsed", "SyntaxError");
     cssRule._parentStyleSheet = this;
     this._rules.splice(idx, 0, cssRule);
-    this._ruleChanged();
+    this._ruleChanged({index: idx, deleteCount: 0, rules: [cssRule.cssText]});
     return idx;
   }
   deleteRule(index) {
@@ -9155,7 +9258,7 @@ class CSSStyleSheet {
     if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
     const [removed] = this._rules.splice(idx, 1);
     if (removed) removed._parentStyleSheet = null;
-    this._ruleChanged();
+    this._ruleChanged({index: idx, deleteCount: 1, rules: []});
   }
   addRule(selector, style, index) {
     this.insertRule(String(selector) + "{" + String(style) + "}", index ?? this._rules.length);
@@ -9200,6 +9303,7 @@ function _sheetForStyleElement(style) {
 function _detachStyleSheet(style) {
   const sheet = _styleElementSheets.get(style);
   if (!sheet) return;
+  __obscuraCore.ops.op_cssom_stylesheet_clear(style._nid, _realmFrameId);
   sheet._ownerNode = null;
   sheet._sourceNode = null;
   _styleElementSheets.delete(style);
@@ -9225,6 +9329,7 @@ function _sheetForLinkElement(link) {
 function _detachLinkedStyleSheet(link) {
   const sheet = _linkElementSheets.get(link);
   if (!sheet) return;
+  __obscuraCore.ops.op_cssom_stylesheet_clear(link._nid, _realmFrameId);
   sheet._ownerNode = null;
   sheet._sourceNode = null;
   _linkElementSheets.delete(link);
@@ -9294,7 +9399,9 @@ Object.defineProperty(Element.prototype, "sheet", {
 });
 globalThis.CSSRule = CSSRule;
 globalThis.CSSStyleRule = CSSStyleRule;
+globalThis.CSSGroupingRule = CSSGroupingRule;
 globalThis.CSSRuleList = CSSRuleList;
+globalThis.StyleSheet = StyleSheet;
 globalThis.CSSStyleSheet = CSSStyleSheet;
 globalThis.StyleSheetList = StyleSheetList;
 
@@ -10156,6 +10263,11 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
   } catch (_e) {}
   el[field] = value;
 };
+globalThis.__obscura_setHovered = function(el) {
+  if (typeof __obscuraCore.ops.op_set_hovered === 'function') {
+    __obscuraCore.ops.op_set_hovered(el?._nid | 0, 0);
+  }
+};
 
 // Build a FileList-like object: an array with the DOM's `item(i)` accessor.
 function _makeFileList(files) {
@@ -10260,7 +10372,7 @@ globalThis.MouseEvent = class extends Event {
   }
 };
 globalThis.KeyboardEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat;this.keyCode=o.keyCode||0;this.charCode=o.charCode||0;this.which=o.which||0; }
   getModifierState(key) {
     switch (String(key)) {
       case 'Alt': return this.altKey;
@@ -10395,10 +10507,6 @@ __obscuraCore.setUnhandledPromiseRejectionHandler((promise, reason) => {
     cancelable: true,
   });
   globalThis.dispatchEvent(event);
-  if (typeof globalThis.onunhandledrejection === "function") {
-    try { globalThis.onunhandledrejection.call(globalThis, event); }
-    catch (error) { console.error(error); }
-  }
   // Browsers report an unhandled rejection without terminating the page's
   // event loop. Returning true tells deno_core that the host delivered it.
   return true;
@@ -10407,10 +10515,6 @@ __obscuraCore.setUnhandledPromiseRejectionHandler((promise, reason) => {
 __obscuraCore.setHandledPromiseRejectionHandler((promise, reason) => {
   const event = new PromiseRejectionEvent("rejectionhandled", { promise, reason });
   globalThis.dispatchEvent(event);
-  if (typeof globalThis.onrejectionhandled === "function") {
-    try { globalThis.onrejectionhandled.call(globalThis, event); }
-    catch (error) { console.error(error); }
-  }
 });
 
 globalThis.StorageEvent = class StorageEvent extends Event {
@@ -12046,7 +12150,12 @@ globalThis.HTMLSpanElement = Element;
 globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = HTMLImageElement;
-globalThis.HTMLInputElement = Element;
+globalThis.HTMLInputElement = class HTMLInputElement extends Element {};
+// Framework value trackers read own prototype descriptors, not inherited ones.
+Object.defineProperties(HTMLInputElement.prototype, {
+  value: Object.getOwnPropertyDescriptor(Element.prototype, 'value'),
+  checked: Object.getOwnPropertyDescriptor(Element.prototype, 'checked'),
+});
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
@@ -12096,7 +12205,10 @@ globalThis.HTMLCanvasElement = Element;
 globalThis.HTMLScriptElement = Element;
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
-globalThis.HTMLMetaElement = Element;
+globalThis.HTMLMetaElement = class HTMLMetaElement extends Element {
+  get httpEquiv() { return this.getAttribute('http-equiv') || ''; }
+  set httpEquiv(value) { this.setAttribute('http-equiv', String(value)); }
+};
 globalThis.HTMLHeadElement = Element;
 globalThis.HTMLBodyElement = Element;
 globalThis.HTMLHtmlElement = Element;
@@ -14095,13 +14207,8 @@ globalThis.IDBKeyRange = {
   bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
 };
 
-globalThis.caches = {
-  open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
-  match() { return Promise.resolve(undefined); },
-  has() { return Promise.resolve(false); },
-  delete() { return Promise.resolve(false); },
-  keys() { return Promise.resolve([]); },
-};
+// Do not advertise CacheStorage until it can retain responses. A successful
+// no-op cache selects broken persistence paths instead of normal fetch fallbacks.
 
 _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);
@@ -15723,8 +15830,8 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // don't form a proper containment hierarchy (a child's rect can lie far
   // outside its parent's), so a tree walk that only descends into ancestors
   // containing (x,y) would never reach a deep <input> inside <label><p>.
-  // Returns the deepest matching element (highest nid wins as a proxy for
-  // tree depth) so descendants beat ancestors.
+  // querySelectorAll returns tree order, which also makes descendants and
+  // later siblings replace the matching boxes behind them.
   Document.prototype.elementFromPoint = function(x, y) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
@@ -15745,7 +15852,6 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     }
     var all = this.querySelectorAll('*');
     var best = null;
-    var bestNid = -1;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
@@ -15792,8 +15898,16 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           ancestor = ancestor.parentElement;
         }
         if (!visible) continue;
-        var nid = el._nid | 0;
-        if (nid > bestNid) { best = el; bestNid = nid; }
+        if (!best || best.contains(el)) {
+          best = el;
+        } else if (!el.contains(best)) {
+          // Positioned boxes paint above in-flow siblings at the auto layer.
+          // ponytail: z-index stacking needs renderer display-list hit testing
+          // when overlapping positioned layers become a measured blocker.
+          var elPositioned = getComputedStyle(el).position !== 'static';
+          var bestPositioned = getComputedStyle(best).position !== 'static';
+          if (elPositioned || !bestPositioned) best = el;
+        }
       }
     }
     return best || this.body || this.documentElement || null;
