@@ -42,7 +42,7 @@ impl Page {
             return false;
         }
         self.url = Some(parsed);
-        self.push_history(self.url_string());
+        self.push_same_document_history(self.url_string());
         true
     }
 }

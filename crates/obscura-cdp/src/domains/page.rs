@@ -1607,6 +1607,7 @@ pub async fn handle(
                     if let Some(page) = ctx.get_session_page_mut(session_id) {
                         page.history = saved_history;
                         page.history_index = prev_index;
+                        page.sync_js_session_history();
                     }
                     return Err(e.to_string());
                 }
@@ -1614,8 +1615,7 @@ pub async fn handle(
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
-                    page.history = saved_history;
-                    page.history_index = entry_id;
+                    page.set_history(saved_history, entry_id);
                     // Flush script-initiated network events before draining,
                     // matching do_navigate — otherwise fetch/XHR requests the
                     // navigated page starts are dropped from CDP events (#920).
@@ -1645,8 +1645,7 @@ pub async fn handle(
         }
         "resetNavigationHistory" => {
             if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.history.clear();
-                page.history_index = 0;
+                page.set_history(Vec::new(), 0);
             }
             Ok(json!({}))
         }
