@@ -71,6 +71,12 @@ The open-source engine stays Apache-2.0, fully featured. No feature gating, ever
 <br>
 **[📅 Book a demo →](https://cal.com/obscura/quick-chat)**
 
+### Open Source Support
+
+<a href="https://vercel.com/open-source-program">
+  <img alt="Vercel OSS Program" src="https://vercel.com/oss/program-badge-2026.svg" />
+</a>
+
 ## Sponsors
 
 **Obscura** is supported by organizations helping us build independent open-source browser infrastructure.
