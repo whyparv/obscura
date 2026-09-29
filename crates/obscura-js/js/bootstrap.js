@@ -2012,7 +2012,10 @@ function _domEventDispatch(target, event) {
     path.push(ancestor);
     ancestor = ancestor.parentNode || null;
   }
-  if (target !== globalThis && path[path.length - 1] !== globalThis) {
+  // Detached nodes have no event parent. Connected paths reach Window through
+  // Document, except for load, whose Document parent is null by specification.
+  const reachesDocument = target === document || path[path.length - 1] === document;
+  if (reachesDocument && event.type !== "load") {
     path.push(globalThis);
   }
 
@@ -3535,6 +3538,10 @@ class Element extends Node {
   // Element for element nodes, and node ids are never freed-and-reused), so this
   // is constant. Overrides Node's dynamic getter to drop one op per nodeType read.
   get nodeType() { return 1; }
+  // DOM wrappers must not carry Object's default brand. Libraries such as
+  // Swiper use Object.prototype.toString to distinguish plain option objects
+  // from host elements before recursively merging them.
+  get [Symbol.toStringTag]() { return "HTMLElement"; }
   get tagName() {
     // An element's qualified name is immutable for its lifetime. React reads
     // nodeName/tagName repeatedly while hydrating; crossing the native bridge
@@ -4862,11 +4869,13 @@ class Element extends Node {
   }
   get offsetWidth() {
     if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
-    return this.getBoundingClientRect().width;
+    const metrics = this._renderBoxMetrics();
+    return metrics ? metrics.offsetWidth : this.getBoundingClientRect().width;
   }
   get offsetHeight() {
     if (this._isViewportRoot()) return globalThis.innerHeight || 720;
-    return this.getBoundingClientRect().height;
+    const metrics = this._renderBoxMetrics();
+    return metrics ? metrics.offsetHeight : this.getBoundingClientRect().height;
   }
   get offsetParent() {
     if (!this.isConnected || this._renderBoxGeometry() === null) return null;
@@ -4927,6 +4936,29 @@ class Element extends Node {
     return metrics ? metrics.height : 20;
   }
   _renderClientMetrics() {
+    const metrics = this._renderBoxMetrics();
+    return metrics ? { width: metrics.clientWidth, height: metrics.clientHeight } : metrics;
+  }
+  _renderBoxMetrics() {
+    if (typeof __obscuraCore.ops.op_layout_box_metrics === 'function') {
+      try {
+        const raw = __obscuraCore.ops.op_layout_box_metrics(String(this._nid | 0));
+        if (!raw) return { clientWidth: 0, clientHeight: 0, offsetWidth: 0, offsetHeight: 0 };
+        const metrics = JSON.parse(raw);
+        if (metrics && Number.isFinite(metrics.clientWidth)
+            && Number.isFinite(metrics.clientHeight)
+            && Number.isFinite(metrics.offsetWidth)
+            && Number.isFinite(metrics.offsetHeight)) {
+          return {
+            clientWidth: Math.round(Math.max(0, metrics.clientWidth)),
+            clientHeight: Math.round(Math.max(0, metrics.clientHeight)),
+            offsetWidth: Math.round(Math.max(0, metrics.offsetWidth)),
+            offsetHeight: Math.round(Math.max(0, metrics.offsetHeight)),
+          };
+        }
+      } catch (_error) {}
+      return { clientWidth: 0, clientHeight: 0, offsetWidth: 0, offsetHeight: 0 };
+    }
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return null;
     try {
       const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
@@ -4939,12 +4971,14 @@ class Element extends Node {
         // subpixel precision for getBoundingClientRect(); client metrics round
         // to whole CSS pixels like Chromium.
         return {
-          width: Math.round(Math.max(0, geometry.clientWidth)),
-          height: Math.round(Math.max(0, geometry.clientHeight)),
+          clientWidth: Math.round(Math.max(0, geometry.clientWidth)),
+          clientHeight: Math.round(Math.max(0, geometry.clientHeight)),
+          offsetWidth: Math.round(Math.max(0, geometry.width)),
+          offsetHeight: Math.round(Math.max(0, geometry.height)),
         };
       }
     } catch (_error) {}
-    return { width: 0, height: 0 };
+    return { clientWidth: 0, clientHeight: 0, offsetWidth: 0, offsetHeight: 0 };
   }
   // `undefined` means this is a non-render build. `null` means the render
   // engine is present but this element has no associated CSS box (for
@@ -12405,7 +12439,9 @@ Object.defineProperty(SVGAnimatedString.prototype, 'animVal', {
 Object.defineProperty(SVGAnimatedString.prototype, Symbol.toStringTag, { value: 'SVGAnimatedString', configurable: true });
 _markNative(SVGAnimatedString);
 
-class SVGElement extends Element {}
+class SVGElement extends Element {
+  get [Symbol.toStringTag]() { return "SVGElement"; }
+}
 class SVGGraphicsElement extends SVGElement {}
 class SVGGeometryElement extends SVGGraphicsElement {}
 class SVGPathElement extends SVGGeometryElement {}

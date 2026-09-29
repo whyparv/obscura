@@ -948,6 +948,7 @@ fn retained_style_mutation(
     cmd: &str,
     arg1: &str,
     arg2: &str,
+    keep_inline_style_values: bool,
 ) -> Option<obscura_render::RetainedStyleMutation> {
     let node = NodeId::new(arg1.parse::<u32>().ok()?);
     // The retained planner and document stylesheet cache are intentionally
@@ -965,18 +966,17 @@ fn retained_style_mutation(
             {
                 return None;
             }
-            let keeps_selector_value = !name.eq_ignore_ascii_case("style");
+            let keep_value = keep_inline_style_values || !name.eq_ignore_ascii_case("style");
             Some(
                 obscura_render::AttributeStyleMutation {
                 node,
                 name: name.to_string(),
-                old_value: keeps_selector_value
-                    .then(|| {
-                            dom.with_node(node, |node| node.get_attribute(name).map(str::to_owned))
-                        .flatten()
+                old_value: keep_value.then(|| {
+                        dom.with_node(node, |node| node.get_attribute(name).map(str::to_owned))
+                            .flatten()
                     })
                     .flatten(),
-                new_value: keeps_selector_value.then(|| value.to_string()),
+                new_value: keep_value.then(|| value.to_string()),
             }
                 .into(),
             )
@@ -987,15 +987,14 @@ fn retained_style_mutation(
             {
                 return None;
             }
-            let keeps_selector_value = !arg2.eq_ignore_ascii_case("style");
+            let keep_value = keep_inline_style_values || !arg2.eq_ignore_ascii_case("style");
             Some(
                 obscura_render::AttributeStyleMutation {
                 node,
                 name: arg2.to_string(),
-                old_value: keeps_selector_value
-                    .then(|| {
-                            dom.with_node(node, |node| node.get_attribute(arg2).map(str::to_owned))
-                        .flatten()
+                old_value: keep_value.then(|| {
+                        dom.with_node(node, |node| node.get_attribute(arg2).map(str::to_owned))
+                            .flatten()
                     })
                     .flatten(),
                 new_value: None,
@@ -1067,7 +1066,8 @@ const MAX_PENDING_STYLE_MUTATIONS: usize = 4_096;
 /// Rendering observes the attribute state at flush boundaries. Repeated writes
 /// to the same node/name therefore retain the first old value and final new
 /// value; intermediate values were never rendered and cannot affect selector
-/// matching. Inline style uses the same rule without storing serialized values.
+/// matching. Inline style keeps the first/final serialized values so CSSOM
+/// metrics can distinguish transform-only edits from layout damage.
 #[cfg(feature = "render")]
 pub(crate) fn queue_retained_style_mutation(
     pending: &mut Vec<obscura_render::RetainedStyleMutation>,
@@ -1611,10 +1611,20 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             .map(|dom| render_mutation_impact(dom, &cmd, &arg1, &arg2))
             .unwrap_or_default();
         #[cfg(feature = "render")]
+        let keep_inline_style_values = state.prepared_render.is_some();
+        #[cfg(feature = "render")]
         let retained_style_mutation = state
             .dom
             .as_ref()
-            .and_then(|dom| retained_style_mutation(dom, &cmd, &arg1, &arg2));
+            .and_then(|dom| {
+                retained_style_mutation(
+                    dom,
+                    &cmd,
+                    &arg1,
+                    &arg2,
+                    keep_inline_style_values,
+                )
+            });
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
@@ -4856,7 +4866,8 @@ mod tests {
                 &dom,
                 "set_attribute",
                 &child.index().to_string(),
-                "class\0changed"
+                "class\0changed",
+                false,
             )
                 .is_none(),
             "shadow mutations require a full scoped cascade"
@@ -6266,6 +6277,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
+        ops.push(op_layout_box_metrics());
         ops.push(op_layout_hit_test());
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
@@ -6663,6 +6675,49 @@ fn ensure_prepared_geometry(state: &mut ObscuraState) -> Option<&obscura_render:
                 && (prepared.animation_sample() == state.animation_sample
                     || prepared.can_reuse_geometry_for_animation_sample(state.animation_sample))
         });
+    if reusable {
+        return state.prepared_render.as_ref();
+    }
+    ensure_prepared_render_with_base_url(state, base_url)
+}
+
+/// Prepare untransformed CSSOM View box metrics. A pending inline transform
+/// must change visual rectangles and paint, but it cannot change client or
+/// offset sizes. Keep that narrow distinction so libraries may measure while
+/// composing transforms without rebuilding layout after every write.
+#[cfg(feature = "render")]
+fn ensure_prepared_box_metrics(
+    state: &mut ObscuraState,
+    target: NodeId,
+) -> Option<&obscura_render::PreparedRender> {
+    let base_url = document_base_url_for_javascript_task(state);
+    let target_ancestors = state
+        .dom
+        .as_ref()
+        .map(|dom| dom.ancestors(target))
+        .unwrap_or_default();
+    let paint_only_inline_styles = !state.pending_style_mutations.is_empty()
+        && state.pending_style_mutations.iter().all(|mutation| {
+            matches!(
+                mutation,
+                obscura_render::RetainedStyleMutation::Attribute(attribute)
+                    if attribute.name.eq_ignore_ascii_case("style")
+                        && !target_ancestors.contains(&attribute.node)
+                        && obscura_render::style::inline_style_change_preserves_box_metrics(
+                            attribute.old_value.as_deref(),
+                            attribute.new_value.as_deref(),
+                        )
+            )
+        });
+    let reusable = (!state.animation_timeline.has_pending_start_candidates()
+        || paint_only_inline_styles)
+        && state.prepared_render.as_ref().is_some_and(|prepared| {
+            prepared.viewport() == state.viewport
+                && prepared.base_url() == base_url.as_deref()
+                && (prepared.animation_sample() == state.animation_sample
+                    || prepared.can_reuse_geometry_for_animation_sample(state.animation_sample))
+        })
+        && (state.pending_style_mutations.is_empty() || paint_only_inline_styles);
     if reusable {
         return state.prepared_render.as_ref();
     }
@@ -7230,6 +7285,35 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
         .to_string();
     }
     String::new()
+}
+
+/// Untransformed padding- and border-box sizes for CSSOM View. Keeping this
+/// separate from visual geometry is both spec-correct and lets transform-only
+/// style writes retain layout until a visual consumer actually needs them.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_box_metrics(state: &OpState, #[string] nid_str: String) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let nid = NodeId::new(nid_str.parse().unwrap_or(0));
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    let Some(prepared) = ensure_prepared_box_metrics(&mut gs, nid) else {
+        return String::new();
+    };
+    let Some((client_width, client_height)) = prepared.client_size(nid) else {
+        return String::new();
+    };
+    let Some((offset_width, offset_height)) = prepared.border_size(nid) else {
+        return String::new();
+    };
+    serde_json::json!({
+        "clientWidth": client_width,
+        "clientHeight": client_height,
+        "offsetWidth": offset_width,
+        "offsetHeight": offset_height,
+    })
+    .to_string()
 }
 
 /// Renderer-backed CSSOM hit test. Returns the native node id or -1 when the

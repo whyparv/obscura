@@ -7507,6 +7507,58 @@ mod tests {
     }
 
     #[test]
+    fn dom_events_only_reach_window_through_document() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                "const seen = [];\
+                 window.addEventListener('load', () => seen.push('window-capture'), true);\
+                 window.addEventListener('click', () => seen.push('window-click-capture'), true);\
+                 document.addEventListener('load', () => seen.push('document-capture'), true);\
+                 document.addEventListener('load', () => seen.push('document-bubble'));\
+                 const script = document.createElement('script');\
+                 script.addEventListener('load', () => seen.push('script'));\
+                 document.head.appendChild(script);\
+                 script.dispatchEvent(new Event('load'));\
+                 script.dispatchEvent(new Event('click'));\
+                 script.remove();\
+                 script.dispatchEvent(new Event('load'));\
+                 script.dispatchEvent(new Event('click'));\
+                 return seen"
+            )
+            .unwrap(),
+            serde_json::json!([
+                "document-capture",
+                "script",
+                "window-click-capture",
+                "script"
+            ])
+        );
+    }
+
+    #[test]
+    fn elements_have_host_object_brands_for_plain_object_guards() {
+        let mut rt = setup_runtime("<html><body><div id='carousel'></div></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                "const element = document.getElementById('carousel');\
+                 const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');\
+                 const isPlainObject = value => typeof value === 'object' && value !== null\
+                     && value.constructor\
+                     && Object.prototype.toString.call(value).slice(8, -1) === 'Object';\
+                 const target = {};\
+                 const source = { element };\
+                 target.element = isPlainObject(source.element) ? {} : source.element;\
+                 return [Object.prototype.toString.call(element),\
+                     Object.prototype.toString.call(svg), isPlainObject(element),\
+                     target.element === element]"
+            )
+            .unwrap(),
+            serde_json::json!(["[object HTMLElement]", "[object SVGElement]", false, true])
+        );
+    }
+
+    #[test]
     fn meta_http_equiv_reflection_supports_snapshot_csp_filtering() {
         let mut rt = setup_runtime(
             r#"<html><head><meta id="plain" charset="utf-8">
@@ -12020,6 +12072,86 @@ mod tests {
         let before = widths[0].as_f64().unwrap();
         let after = widths[1].as_f64().unwrap();
         assert!(after >= before + 7.0, "before={before}, after={after}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn transform_only_writes_retain_untransformed_cssom_box_metrics() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="box" style="width:40px;height:20px;transform:scale(2)"></div>
+                <div id="parent" style="width:80px;height:20px">
+                    <div id="fixed" style="position:fixed;width:50%;height:5px"></div>
+                </div>
+            </body></html>"#,
+        ));
+        rt.set_viewport(200.0, 100.0);
+        rt.run_page_init();
+
+        let initial = rt
+            .evaluate(
+                r#"(() => {
+                    const box = document.getElementById('box');
+                    return [box.offsetWidth, box.clientWidth, box.getBoundingClientRect().width];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(initial[0].as_f64(), Some(40.0));
+        assert_eq!(initial[1].as_f64(), Some(40.0));
+        assert_eq!(initial[2].as_f64(), Some(80.0));
+
+        let retained = rt
+            .evaluate(
+                r#"(() => {
+                    const box = document.getElementById('box');
+                    box.style.transform = 'scale(3)';
+                    return [box.offsetWidth, box.clientWidth];
+                })()"#,
+            )
+            .unwrap();
+        let retained = retained.as_array().unwrap();
+        assert_eq!(retained[0].as_f64(), Some(40.0));
+        assert_eq!(retained[1].as_f64(), Some(40.0));
+        assert!(
+            !rt.state.borrow().pending_style_mutations.is_empty(),
+            "layout-only metrics must leave transform paint damage pending"
+        );
+
+        assert_eq!(
+            rt.evaluate("document.getElementById('box').getBoundingClientRect().width")
+                .unwrap()
+                .as_f64(),
+            Some(120.0),
+            "visual geometry must still materialize the pending transform"
+        );
+        assert!(rt.state.borrow().pending_style_mutations.is_empty());
+
+        assert_eq!(
+            rt.evaluate(
+                "(() => { const box = document.getElementById('box'); box.style.width='70px'; return box.offsetWidth; })()"
+            )
+            .unwrap()
+            .as_f64(),
+            Some(70.0),
+            "layout-affecting inline edits must not use the transform fast path"
+        );
+
+        assert_eq!(
+            rt.evaluate("document.getElementById('fixed').offsetWidth")
+                .unwrap()
+                .as_f64(),
+            Some(100.0)
+        );
+        assert_eq!(
+            rt.evaluate(
+                "(() => { document.getElementById('parent').style.transform='translateZ(0)'; return document.getElementById('fixed').offsetWidth; })()"
+            )
+            .unwrap()
+            .as_f64(),
+            Some(40.0),
+            "an ancestor transform can change a positioned descendant's containing block"
+        );
     }
 
     #[cfg(feature = "render")]

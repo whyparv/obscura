@@ -505,6 +505,46 @@ pub(crate) fn split_declarations(css: &str) -> Vec<&str> {
     parts
 }
 
+/// Whether an inline-style edit can leave CSSOM View's untransformed box
+/// metrics intact. This is deliberately narrower than "paint only": callers
+/// use it only for `client*`/`offset*`, while transformed visual rectangles
+/// still force an exact render. Comparing every other declaration in source
+/// order keeps shorthands, custom properties, priorities, and duplicate
+/// declarations conservative without maintaining a second CSS cascade.
+pub fn inline_style_change_preserves_box_metrics(old: Option<&str>, new: Option<&str>) -> bool {
+    fn next_layout_declaration<'a>(
+        declarations: &mut impl Iterator<Item = &'a str>,
+    ) -> Option<(&'a str, &'a str)> {
+        loop {
+            let raw = declarations.next()?;
+            let Some((name, value)) = raw.trim().split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("transform")
+                || name.eq_ignore_ascii_case("-webkit-transform")
+            {
+                continue;
+            }
+            return Some((name, value.trim()));
+        }
+    }
+
+    let mut old = old.into_iter().flat_map(split_declarations);
+    let mut new = new.into_iter().flat_map(split_declarations);
+    loop {
+        match (
+            next_layout_declaration(&mut old),
+            next_layout_declaration(&mut new),
+        ) {
+            (Some((old_name, old_value)), Some((new_name, new_value)))
+                if old_name.eq_ignore_ascii_case(new_name) && old_value == new_value => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 fn parse_containment(value: &str) -> Option<u8> {
     use crate::{CONTAIN_SIZE, CONTAIN_INLINE_SIZE, CONTAIN_LAYOUT, CONTAIN_STYLE, CONTAIN_PAINT};
     let value = value.trim().to_ascii_lowercase();

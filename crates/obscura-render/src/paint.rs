@@ -1353,6 +1353,18 @@ impl PreparedRender {
         ))
     }
 
+    /// Untransformed border-box size used by CSSOM View's `offsetWidth` and
+    /// `offsetHeight`. Unlike `getBoundingClientRect()`, transforms do not
+    /// participate in these integer layout metrics.
+    pub fn border_size(&self, id: obscura_dom::tree::NodeId) -> Option<(f32, f32)> {
+        let rect = self.layout.rects.get(&id)?;
+        let style = self.layout.styles.get(&id)?;
+        if style.ignores_used_box_sizes() {
+            return Some((0.0, 0.0));
+        }
+        Some((rect.width.max(0.0), rect.height.max(0.0)))
+    }
+
     /// Whether hit testing must ignore this element's generated box.
     pub fn pointer_events_none(&self, id: obscura_dom::tree::NodeId) -> bool {
         self.layout
