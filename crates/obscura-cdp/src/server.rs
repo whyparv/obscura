@@ -1936,8 +1936,6 @@ async fn process_with_interception(
 
     ctx.pages.push(page);
 
-    #[cfg(feature = "render")]
-    let navigation_succeeded = navigate_result.is_ok();
     let response = match navigate_result {
         Ok(()) => crate::types::CdpResponse::success(
             req.id,
@@ -1969,10 +1967,6 @@ async fn process_with_interception(
         wait_until,
         reached_network_idle,
     );
-    #[cfg(feature = "render")]
-    if navigation_succeeded {
-        crate::domains::page::schedule_screencast_frame(ctx, &session_for_events);
-    }
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = reply_tx.send(json);
@@ -2643,6 +2637,53 @@ mod tests {
         assert!(cookies.iter().any(|c| c.name == "other"));
         assert!(cookies.iter().any(|c| c.name == "added"));
         assert!(!cookies.iter().any(|c| c.name == "removed"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_navigation_emits_new_document_frame_before_load_completion() {
+        use base64::Engine as _;
+        tokio::task::LocalSet::new().run_until(async {
+            let mut ctx = crate::dispatch::CdpContext::new();
+            let page_id = ctx.create_page();
+            let session = Some(format!("{page_id}-session"));
+            ctx.sessions.insert(session.clone().unwrap(), page_id);
+            crate::domains::page::handle("navigate", &json!({
+                "url":"data:text/html,<body style='background:white'>", "waitUntil":"load"
+            }), &mut ctx, &session).await.unwrap();
+            crate::domains::page::handle("startScreencast", &json!({
+                "format":"png", "maxWidth":8, "maxHeight":8
+            }), &mut ctx, &session).await.unwrap();
+            let stream_id = ctx.screencasts[session.as_ref().unwrap()].session_id;
+            crate::domains::page::handle("screencastFrameAck", &json!({"sessionId":stream_id}),
+                &mut ctx, &session).await.unwrap();
+            ctx.pending_events.clear();
+
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut intercept_rx = None;
+            let mut paused = HashMap::new();
+            let mut deferred = std::collections::VecDeque::new();
+            super::process_with_interception(&json!({
+                "id":1, "method":"Page.navigate", "sessionId":session,
+                "params":{"url":"data:text/html,<body style='background:rgb(0,0,255)'>", "waitUntil":"load"}
+            }).to_string(), &mut ctx, &reply_tx, &mut server_rx,
+                &mut intercept_rx, &mut paused, &mut deferred, true).await;
+            let mut events = Vec::new();
+            while let Ok(text) = reply_rx.try_recv() {
+                events.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+            }
+            let frame = events.iter().position(|event| event["method"] == "Page.screencastFrame")
+                .expect("recorded navigation must not wait for a later compositor tick");
+            let loaded = events.iter().position(|event| event["method"] == "Page.loadEventFired")
+                .expect("load completion");
+            assert!(frame < loaded, "a client can stop recording immediately after load");
+            assert_eq!(events[frame]["sessionId"], json!(session));
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(events[frame]["params"]["data"].as_str().unwrap()).unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert_eq!(image.get_pixel(image.width()/2, image.height()/2).0, [0,0,255,255]);
+        }).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
