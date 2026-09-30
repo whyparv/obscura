@@ -6100,6 +6100,23 @@ mod tests {
     }
 
     #[test]
+    fn history_reads_host_session_entries_and_queues_cross_document_traversal() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_session_history(
+            vec!["http://example.com/one".into(), "http://example.com/two".into()],
+            1,
+            1,
+        );
+        assert_eq!(rt.evaluate("history.length").unwrap(), serde_json::json!(2.0));
+        rt.evaluate("history.back()").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/one".into(), "GET".into(), String::new())),
+        );
+        assert_eq!(rt.take_pending_history_traversal(), Some(0));
+    }
+
+    #[test]
     fn style_attribute_parses_into_style_object() {
         // Inline styles present in the parsed HTML must be visible via el.style.*
         let mut rt = setup_runtime(
