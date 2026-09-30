@@ -853,17 +853,18 @@ fn run_connection(
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let mut processor = tokio::task::spawn_local(cdp_processor(
+                // Run the processor in the connection future. A self-waking
+                // LocalSet task can run 61 times before Tokio services I/O,
+                // starving fetch under a continuously ready page scheduler.
+                let processor = cdp_processor(
                     msg_rx, default_context, shutdown_notify,
-                ));
+                );
+                tokio::pin!(processor);
                 tokio::select! {
                     _ = &mut processor => {}
-                    _ = io_done_rx => {
-                        // A disconnected client must cancel an in-flight
-                        // navigation/evaluation rather than wait its deadline.
-                        processor.abort();
-                        let _ = processor.await;
-                    }
+                    // Dropping the processor cancels an in-flight command.
+                    // Detached navigation tasks are dropped with the LocalSet.
+                    _ = io_done_rx => {}
                 }
             });
             let _ = io_stop_tx.send(());
@@ -1243,7 +1244,6 @@ async fn cdp_processor(
                             runtime_pump_armed = runtime_pump_error_streak <= 3
                                 && ctx.pages.iter().any(|page| page.has_js());
                             tracing::warn!("autonomous page task failed: {error}");
-                            tokio::task::yield_now().await;
                         }
                     }
                     service_live_page_render_resources(&mut ctx);
@@ -1277,6 +1277,9 @@ async fn cdp_processor(
                         idle_pages.clear();
                         runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
                     }
+                    // Ready page tasks must not keep this root future running
+                    // indefinitely while Tokio's network tasks wait to run.
+                    tokio::task::yield_now().await;
                     None
                 },
                 Some(intercepted) = async {
@@ -2345,6 +2348,118 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("connection and I/O threads must stop on socket close");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_fetch_progresses_during_continuously_ready_page_tasks() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::time::{Duration, Instant};
+        use tokio_tungstenite::tungstenite::Message;
+
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hydrate", http.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..3 {
+                let (mut stream, _) = http.accept().unwrap();
+                let mut request = [0u8; 2048];
+                stream.read(&mut request).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\nhydrated").unwrap();
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(1));
+        let live_server = live.clone();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let context = crate::dispatch::CdpContext::new().default_context;
+            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
+        accept.await.unwrap();
+        ws.send(Message::Text(json!({"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}).to_string().into())).await.unwrap();
+        let mut session = None;
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if let Some(id) = value["params"]["sessionId"].as_str() { session = Some(id.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+        }
+        let body = format!(r#"
+            const channel = new MessageChannel();
+            const deadline = Date.now() + 5000;
+            let turns = 0;
+            channel.port1.onmessage = () => {{
+                turns++;
+                const taskEnd = Date.now() + 60;
+                while (Date.now() < taskEnd) {{}}
+                if (Date.now() < deadline) channel.port2.postMessage(null);
+            }};
+            channel.port2.postMessage(null);
+            const text = await (await fetch({url:?})).text();
+            channel.port1.close(); channel.port2.close();
+            return {{text, turns}};
+        "#);
+        for (id, method, params) in [
+            (2, "Runtime.evaluate", json!({"expression":format!("(async()=>{{{body}}})()"),"awaitPromise":true,"returnByValue":true})),
+            (3, "Runtime.callFunctionOn", json!({"functionDeclaration":format!("async function(){{{body}}}"),"awaitPromise":true,"returnByValue":true})),
+        ] {
+            let started = Instant::now();
+            ws.send(Message::Text(json!({"id":id,"method":method,"sessionId":session,"params":params}).to_string().into())).await.unwrap();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(8), ws.next()).await.unwrap().unwrap().unwrap();
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == id {
+                        assert_eq!(value["result"]["result"]["value"]["text"], "hydrated", "{value}");
+                        assert!(value["result"]["result"]["value"]["turns"].as_f64().unwrap() > 0.0);
+                        break;
+                    }
+                }
+            }
+            assert!(started.elapsed() < Duration::from_secs(2),
+                "{method} starved network work behind ready page tasks: {:?}", started.elapsed());
+        }
+        ws.send(Message::Text(json!({"id":4,"method":"Runtime.evaluate","sessionId":session,
+            "params":{"expression":format!("(async()=>{{{body}}})().then(value => globalThis.__autonomousFetch = value); 'armed'"),"returnByValue":true}}).to_string().into())).await.unwrap();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["id"] == 4 {
+                    assert_eq!(value["result"]["result"]["value"], "armed", "{value}");
+                    break;
+                }
+            }
+        }
+        // No awaited command drives this fetch: the idle browser pump must
+        // share the owning Tokio runtime with the network tasks too.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        ws.send(Message::Text(json!({"id":5,"method":"Runtime.evaluate","sessionId":session,
+            "params":{"expression":"globalThis.__autonomousFetch","returnByValue":true}}).to_string().into())).await.unwrap();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["id"] == 5 {
+                    assert_eq!(value["result"]["result"]["value"]["text"], "hydrated",
+                        "autonomous page tasks starved background networking: {value}");
+                    break;
+                }
+            }
+        }
+        ws.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live.load(Ordering::Acquire) != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("connection must release its slot");
     }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
