@@ -13674,6 +13674,75 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn scroll_into_view_moves_nested_scrollports_before_the_viewport() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:1800px">
+                <div id="scroller" style="margin-top:200px;height:200px;overflow:auto">
+                    <div style="height:600px"></div>
+                    <div id="target" style="height:40px"></div>
+                    <div style="height:600px"></div>
+                </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(800.0, 600.0);
+        rt.run_page_init();
+        let result = rt.evaluate(r#"
+            const scroller = document.getElementById('scroller');
+            const target = document.getElementById('target');
+            const results = [];
+            for (const block of ['nearest', 'center', 'start', 'end']) {
+                scrollTo(0, 0);
+                scroller.scrollTop = 0;
+                target.scrollIntoView({block});
+                results.push([scroller.scrollTop, scrollY, target.getBoundingClientRect().top]);
+            }
+            scrollTo(0, 0);
+            target.scrollIntoView({block: 'nearest'});
+            results.push([scroller.scrollTop, scrollY, target.getBoundingClientRect().top]);
+            return results;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [440, 0, 360], [520, 0, 280], [600, 200, 0],
+            [440, 0, 360], [440, 0, 360],
+        ]));
+    }
+
+    #[test]
+    fn removing_a_focused_subtree_clears_focus_without_firing_blur() {
+        let mut rt = setup_runtime("<main id=parent></main>");
+        let result = rt.evaluate(r#"
+            const parent = document.getElementById('parent');
+            const rows = [];
+            for (const remove of [
+                host => host.remove(),
+                host => parent.removeChild(host),
+                host => parent.replaceChild(document.createElement('div'), host),
+                host => { parent.innerHTML = ''; },
+                host => { parent.textContent = ''; },
+                host => parent.replaceChildren(),
+                host => host.replaceWith(document.createElement('div')),
+            ]) {
+                parent.innerHTML = '<section><button>Apply</button></section>';
+                const host = parent.firstChild, button = host.firstChild;
+                let blurred = 0;
+                button.addEventListener('blur', () => blurred++);
+                button.addEventListener('focusout', () => blurred++);
+                button.focus();
+                const focused = document.activeElement === button;
+                remove(host);
+                // Reinsert without reading activeElement while disconnected.
+                parent.appendChild(host);
+                rows.push([focused, document.activeElement === document.body, blurred]);
+            }
+            return rows;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!(vec![serde_json::json!([true,true,0]); 7]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn scroll_into_view_emits_events_only_when_the_root_moves() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
