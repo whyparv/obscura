@@ -583,6 +583,36 @@ fn response_body_byte_limit() -> usize {
         .unwrap_or(2 * 1024 * 1024)
 }
 
+fn record_js_network_completion(
+    state: &RefCell<OpState>,
+    event: JsNetworkEvent,
+    body: &str,
+    base64_encoded: bool,
+) {
+    let state_borrow = state.borrow();
+    let gs = state_borrow.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
+        gs.network_response_bodies.insert(event.request_id.clone(), StoredNetworkResponseBody {
+            body: body.to_string(), base64_encoded,
+        });
+        gs.network_response_body_order.push_back(event.request_id.clone());
+        while gs.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                gs.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+    gs.js_network_events.push(event);
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        gs.js_network_events.drain(0..overflow);
+    }
+}
+
 /// Hard cap on a single JS fetch/XHR response body buffered fully in memory.
 /// `op_fetch_url` reads the whole body, then makes a UTF-8 copy and a base64
 /// copy of it, so an unbounded body OOMs the process. This bounds the initial
@@ -3178,7 +3208,18 @@ async fn op_fetch_url(
                     body: b,
                     body_base64: bb,
                 }) => {
-                    return Ok(intercept_fulfill_response(
+                    // Keep fulfilled responses visible to CDP just like transport
+                    // responses, including exact binary bodies and bounded retention.
+                    let encoded = !bb.is_empty();
+                    let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
+                    record_js_network_completion(&state, JsNetworkEvent {
+                        request_id: request_id.clone(), intercepted: true,
+                        url: url.clone(), method: method.clone(), status,
+                        response_headers: h.clone(), body_size,
+                        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs_f64(),
+                    }, if encoded { &bb } else { &b }, encoded);
+                    let mut response = intercept_fulfill_response(
                         status,
                         h,
                         &b,
@@ -3188,8 +3229,9 @@ async fn op_fetch_url(
                         &mode,
                         credentials,
                         internal_load,
-                    )
-                    .to_string());
+                    );
+                    response["requestId"] = serde_json::json!(request_id);
+                    return Ok(response.to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -3666,52 +3708,13 @@ async fn op_fetch_url(
             cbs.fire_response(&info, &resp).await;
         }
     }
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            intercepted: was_intercepted,
-            url: current_url.clone(),
-            method: current_method.as_str().to_string(),
-            status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
+    record_js_network_completion(&state, JsNetworkEvent {
+        request_id: request_id.clone(), intercepted: was_intercepted,
+        url: current_url.clone(), method: current_method.as_str().to_string(), status,
+        response_headers: resp_headers.clone(), body_size: resp_bytes.len(),
+        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs_f64(),
+    }, &resp_body, false);
 
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
@@ -3731,7 +3734,7 @@ async fn op_fetch_url(
         "status": if opaque { 0 } else { status },
         "body": if opaque { String::new() } else { resp_body },
         "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
-        "requestId": response_request_id,
+        "requestId": request_id,
         "url": current_url,
         "redirected": redirected,
         "opaque": opaque,
