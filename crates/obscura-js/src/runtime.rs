@@ -958,26 +958,15 @@ impl ObscuraJsRuntime {
     /// client, callbacks and the stealth transport. A frame shares these with
     /// its page, exactly as it shares them in a browser.
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
-        let parent = self.state.borrow();
-        frame.cookie_jar = parent.cookie_jar.clone();
-        frame.http_client = parent.http_client.clone();
-        frame.callbacks = parent.callbacks.clone();
-        frame.encoding = parent.encoding.clone();
-        frame.blocked_urls = parent.blocked_urls.clone();
-        frame.intercept_enabled = parent.intercept_enabled;
-        frame.page_in_flight = parent.page_in_flight.clone();
-        #[cfg(feature = "stealth")]
-        {
-            frame.stealth_client = parent.stealth_client.clone();
-        }
         // A frame realm shares the page transport, so its renderer cache must
         // not open synchronous requests either. Frame geometry currently
         // resolves against the main document's renderer state, so frame-scoped
         // background loading is not wired up here.
-        #[cfg(feature = "render")]
-        if crate::ops::has_page_transport(&parent) {
-            frame.render_resources.set_sync_loading_enabled(false);
-        }
+        frame.inherit_resources(&self.state.borrow());
+    }
+
+    pub fn forget_frame_state(&mut self, frame_id: u32) {
+        self.realm_states().borrow_mut().forget_frame(frame_id);
     }
 
     /// The origin of the document this runtime is running, or `"null"` for a
@@ -4947,6 +4936,64 @@ mod tests {
                 "constructible": false,
             })
         );
+    }
+
+    #[test]
+    fn initial_blank_iframe_eval_uses_the_child_realm() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const iframe = document.createElement('iframe');
+                    document.body.appendChild(iframe);
+                    const child = iframe.contentWindow;
+                    const globalMatches = child.eval('globalThis') === child;
+                    const constructorMatches = child.eval('Array') === child.Array;
+                    child.eval('globalThis.__initialFrameSentinel = 123');
+                    return [globalMatches, constructorMatches,
+                        child.__initialFrameSentinel === 123,
+                        globalThis.__initialFrameSentinel === undefined];
+                })()"#,
+            ).unwrap(),
+            serde_json::json!([true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn document_open_does_not_use_overridden_head_or_body_getters() {
+        let mut rt = setup_runtime(
+            "<html><head><base href='https://parent.example/'></head><body>parent</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const childDocument = iframe.contentDocument;
+            Object.defineProperties(childDocument, {
+                head: { get: () => document.head },
+                body: { get: () => document.body },
+            });
+            Document.prototype.open.call(childDocument);
+            return [document.body.textContent, document.baseURI];
+        })()"#).unwrap(), serde_json::json!(["parent", "https://parent.example/"]));
+    }
+
+    #[test]
+    fn borrowed_document_methods_keep_the_receiver_realm_after_prototype_remap() {
+        let mut rt = setup_runtime(
+            "<html><head><base href='https://parent.example/'></head><body>parent</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const child = iframe.contentWindow;
+            const childDocument = child.document;
+            Object.setPrototypeOf(childDocument, Document.prototype);
+            const initialUrl = childDocument.URL;
+            const separateBody = childDocument.querySelector('body') !== document.body;
+            Document.prototype.open.call(childDocument);
+            return [document.body.textContent, document.baseURI, document.readyState,
+                separateBody, initialUrl];
+        })()"#).unwrap(), serde_json::json!([
+            "parent", "https://parent.example/", "complete", true, "about:blank"
+        ]));
     }
 
     #[test]
