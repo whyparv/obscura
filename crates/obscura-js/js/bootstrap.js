@@ -4950,7 +4950,7 @@ class Element extends Node {
   _renderBoxMetrics() {
     if (typeof __obscuraCore.ops.op_layout_box_metrics === 'function') {
       try {
-        const raw = __obscuraCore.ops.op_layout_box_metrics(String(this._nid | 0));
+        const raw = __obscuraCore.ops.op_layout_box_metrics(String(this._nid | 0), _realmFrameId);
         if (!raw) return { clientWidth: 0, clientHeight: 0, offsetWidth: 0, offsetHeight: 0 };
         const metrics = JSON.parse(raw);
         if (metrics && Number.isFinite(metrics.clientWidth)
@@ -4969,7 +4969,7 @@ class Element extends Node {
     }
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId);
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4996,7 +4996,7 @@ class Element extends Node {
   _renderBoxGeometry() {
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId);
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -5060,7 +5060,7 @@ class Element extends Node {
   _renderScrollMetrics() {
     if (typeof __obscuraCore.ops.op_layout_metrics !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_layout_metrics();
+      const raw = __obscuraCore.ops.op_layout_metrics(_realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5069,7 +5069,7 @@ class Element extends Node {
   _renderElementScrollMetrics() {
     if (typeof __obscuraCore.ops.op_element_scroll_metrics !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_element_scroll_metrics(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_element_scroll_metrics(String(this._nid | 0), _realmFrameId);
       if (!raw) return null;
       const metrics = JSON.parse(raw);
       return metrics && metrics.hasBox !== false ? metrics : null;
@@ -5080,7 +5080,7 @@ class Element extends Node {
   _renderScrollOffset() {
     if (typeof __obscuraCore.ops.op_scroll_offset !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_scroll_offset();
+      const raw = __obscuraCore.ops.op_scroll_offset(_realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5089,7 +5089,7 @@ class Element extends Node {
   _setRenderScroll(x, y) {
     if (typeof __obscuraCore.ops.op_scroll_to !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_scroll_to(+x || 0, +y || 0);
+      const raw = __obscuraCore.ops.op_scroll_to(+x || 0, +y || 0, _realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5098,7 +5098,7 @@ class Element extends Node {
   _setRenderElementScroll(x, y) {
     if (typeof __obscuraCore.ops.op_element_scroll_to !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
+      const raw = __obscuraCore.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0, _realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -8400,7 +8400,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   const hasRenderer = typeof __obscuraCore.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), _realmFrameId);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -8502,7 +8502,7 @@ function _roMeasurements(targets) {
   if (typeof bulk === "function"
       && targets.every(target => target?._nid != null)) {
     try {
-      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)));
+      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)), _realmFrameId);
       const geometries = raw ? JSON.parse(raw) : null;
       if (Array.isArray(geometries) && geometries.length === targets.length) {
         for (let index = 0; index < targets.length; index++) {
@@ -8893,13 +8893,20 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
   };
 });
 // getComputedStyle() returns a fresh declaration object, but those objects all
-// observe the same computed style for an element until the document mutates.
+// observe the same computed style until the document or viewport changes.
 // Share the immutable native snapshot behind them. Frameworks routinely call
 // getComputedStyle() repeatedly on the same few roots; rebuilding and parsing
 // several hundred properties for every wrapper dominated real-page startup.
 const _computedStyleSnapshotCache = new WeakMap();
 globalThis.getComputedStyle = (el, pseudo = '') => {
   if (!el) el = document.body || {};
+  // Resolve foreign elements in their document's realm, including its live
+  // mutation epoch. Node ids and style caches are document-local.
+  const view = el.ownerDocument?.defaultView;
+  if (view && view !== globalThis && typeof view.getComputedStyle === 'function'
+      && view.getComputedStyle !== globalThis.getComputedStyle) {
+    return view.getComputedStyle(el, pseudo);
+  }
   pseudo = String(pseudo || '').toLowerCase();
   const style = el?.style || el?._style || new CSSStyleDeclaration();
   // Render builds expose one immutable snapshot from the retained final
@@ -8908,21 +8915,25 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   const cacheable = (typeof el === 'object' && el !== null) || typeof el === 'function';
   let snapshot = !pseudo && cacheable ? _computedStyleSnapshotCache.get(el) : null;
   if (!snapshot) {
-    snapshot = { rendered: null, epoch: -1, names: [], complete: false };
+    snapshot = { rendered: null, epoch: -1, viewportWidth: -1, viewportHeight: -1, names: [], complete: false };
     if (!pseudo && cacheable) _computedStyleSnapshotCache.set(el, snapshot);
   }
   const refreshRendered = (property = '') => {
+    const viewportWidth = globalThis.innerWidth, viewportHeight = globalThis.innerHeight;
     const hasRunningAnimation = typeof _animationsForTarget === 'function'
       && _animationsForTarget(el).some(animation => animation.playState === 'running');
     if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation
+        && snapshot.viewportWidth === viewportWidth && snapshot.viewportHeight === viewportHeight
         && (snapshot.complete || (property && snapshot.rendered
             && Object.prototype.hasOwnProperty.call(snapshot.rendered, property)))) return;
     snapshot.epoch = _domMutationEpoch;
+    snapshot.viewportWidth = viewportWidth;
+    snapshot.viewportHeight = viewportHeight;
     snapshot.rendered = null;
     snapshot.complete = true;
     if (typeof __obscuraCore.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0), pseudo, property);
+        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0), pseudo, property, _realmFrameId);
         if (raw) [snapshot.complete, snapshot.rendered] = JSON.parse(raw);
       } catch (e) {}
     }
@@ -10114,7 +10125,7 @@ function _ioMeasurements(elements) {
   const nativeElements = elements.filter(element => element?._nid != null);
   if (typeof bulk !== "function" || !nativeElements.length) return measurements;
   try {
-    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)));
+    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)), _realmFrameId);
     const geometries = raw ? JSON.parse(raw) : null;
     if (Array.isArray(geometries) && geometries.length === nativeElements.length) {
       for (let index = 0; index < nativeElements.length; index++) {
@@ -16084,7 +16095,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
     if (x < 0 || y < 0 || x > w || y > h) return null;
     if (typeof __obscuraCore.ops.op_layout_hit_test === 'function') {
-      var hitNid = __obscuraCore.ops.op_layout_hit_test(x, y);
+      var hitNid = __obscuraCore.ops.op_layout_hit_test(x, y, _realmFrameId);
       if (hitNid >= 0) {
         var hit = _wrapEl(hitNid);
         return hit === this.documentElement && this.body ? this.body : hit;

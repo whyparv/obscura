@@ -1491,16 +1491,7 @@ impl ObscuraJsRuntime {
             return;
         }
         #[cfg(feature = "render")]
-        {
-            let mut state = self.state.borrow_mut();
-            let viewport = (width as f32, height as f32);
-            if state.viewport != viewport {
-                state.viewport = viewport;
-                state.prepared_render = None;
-                state.pending_style_mutations.clear();
-                state.resolved_scroll = None;
-            }
-        }
+        self.state.borrow_mut().set_viewport(width, height);
         let _ = self.execute_runtime_script(
             "<set-viewport>",
             format!(
@@ -4976,6 +4967,48 @@ mod tests {
         })()"#).unwrap(), serde_json::json!(["parent", "https://parent.example/"]));
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn synchronous_iframe_geometry_uses_the_owning_document() {
+        let mut rt = setup_runtime(
+            "<html><head><style>body{margin:4px}#parent{width:45px;height:30px}</style></head><body><div id='parent'></div></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<style>body{margin:8px}div{width:100px;height:20px}</style><div id="child"></div>';
+            const element = d.getElementById('child');
+            const range = d.createRange(); range.selectNode(element);
+            return [[...element.getClientRects()].map(r => [r.width, r.height, r.bottom]),
+                [...range.getClientRects()].map(r => r.bottom),
+                [element.clientWidth, element.clientHeight, element.offsetWidth, element.offsetHeight],
+                d.elementFromPoint(10, 10) === element,
+                document.getElementById('parent').getBoundingClientRect().width];
+        })()"#).unwrap(), serde_json::json!([
+            [[100, 20, 28]], [28], [100, 20, 100, 20], true, 45
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn computed_style_on_a_foreign_frame_element_tracks_its_document() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<style>#child{width:100px;height:20px;color:rgb(12,34,56)}</style><div id="child"></div>';
+            const element = d.getElementById('child');
+            const style = getComputedStyle(element);
+            const before = [style.width, style.color];
+            element.style.width = '120px';
+            element.style.color = 'rgb(78,90,12)';
+            return [before, [style.width, style.color], getComputedStyle(element).color];
+        })()"#).unwrap(), serde_json::json!([
+            ["100px", "rgb(12, 34, 56)"], ["120px", "rgb(78, 90, 12)"], "rgb(78, 90, 12)"
+        ]));
+    }
+
     #[test]
     fn borrowed_document_methods_keep_the_receiver_realm_after_prototype_remap() {
         let mut rt = setup_runtime(
@@ -7868,6 +7901,30 @@ mod tests {
         assert_eq!(result["atomic"], serde_json::json!([80, 30]));
         assert_eq!(result["replaced"], serde_json::json!([80, 30]));
         assert_eq!(result["item"], serde_json::json!([90, 25, "block"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_refreshes_after_viewport_changes_without_dom_mutation() {
+        let mut rt = setup_runtime(r#"<style>
+            body { margin:0 }
+            #box { width:50vw; height:25vh; color:rgb(12,34,56) }
+            @media(max-width:250px) { #box { color:rgb(78,90,12) } }
+        </style><div id=box></div>"#);
+        rt.set_viewport(300.0, 80.0);
+        assert_eq!(rt.evaluate(r#"(() => {
+            globalThis.savedStyle = getComputedStyle(document.getElementById('box'));
+            return [savedStyle.width, savedStyle.height, savedStyle.color];
+        })()"#).unwrap(), serde_json::json!(["150px", "20px", "rgb(12, 34, 56)"]));
+        rt.set_viewport(200.0, 120.0);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const fresh = getComputedStyle(document.getElementById('box'));
+            return [[savedStyle.width, savedStyle.height, savedStyle.color],
+                [fresh.width, fresh.height, fresh.color]];
+        })()"#).unwrap(), serde_json::json!([
+            ["100px", "30px", "rgb(78, 90, 12)"],
+            ["100px", "30px", "rgb(78, 90, 12)"]
+        ]));
     }
 
     #[cfg(feature = "render")]
@@ -12822,10 +12879,10 @@ mod tests {
                 const nativeBulk = __obscura_test_ops.op_resize_observer_measurements;
                 const nativeGeometry = __obscura_test_ops.op_layout_geometry;
                 const nativeComputedStyle = __obscura_test_ops.op_computed_style;
-                __obscura_test_ops.op_resize_observer_measurements = input => {
+                __obscura_test_ops.op_resize_observer_measurements = (input, frameId) => {
                     __resizeBulkCalls++;
                     __resizeBulkSizes.push(JSON.parse(input).length);
-                    return nativeBulk(input);
+                    return nativeBulk(input, frameId);
                 };
                 __obscura_test_ops.op_layout_geometry = (...args) => {
                     __resizeLegacyGeometryCalls++;
@@ -13190,10 +13247,10 @@ mod tests {
                 const nativeBulk = __obscura_test_ops.op_intersection_observer_measurements;
                 const nativeGeometry = __obscura_test_ops.op_layout_geometry;
                 const nativeComputedStyle = __obscura_test_ops.op_computed_style;
-                __obscura_test_ops.op_intersection_observer_measurements = input => {
+                __obscura_test_ops.op_intersection_observer_measurements = (input, frameId) => {
                     __intersectionBulkCalls++;
                     __intersectionBulkSizes.push(JSON.parse(input).length);
-                    return nativeBulk(input);
+                    return nativeBulk(input, frameId);
                 };
                 __obscura_test_ops.op_layout_geometry = (...args) => {
                     __intersectionLegacyGeometryCalls++;
