@@ -4564,6 +4564,7 @@ class Element extends Node {
     if (oldId) {
       delete globalThis.__obscura_frameElements[oldId];
       delete globalThis.__obscura_frameWindows[oldId];
+      delete globalThis.__obscura_frameObjects[oldId];
     }
     this._frameId = 0;
     this._iframeLoadingUrl = null;
@@ -4600,6 +4601,7 @@ class Element extends Node {
         // document below stays: it is what the parent reads through
         // contentDocument.
         const box = el.getBoundingClientRect();
+        if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
           loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
@@ -4634,6 +4636,7 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    if (_ensureInitialFrameRealm(this) === false) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -4655,6 +4658,7 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    if (_ensureInitialFrameRealm(this) === false) return null;
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
       if (win) return win;
@@ -5649,7 +5653,10 @@ class Document extends Node {
     }
     title.textContent = value;
   }
-  get URL() { return _domParse("document_url") ?? ""; }
+  get URL() {
+    const get = _documentRealmMember(this, 'URL');
+    return get ? Reflect.apply(get, this, []) : (_domParse("document_url") ?? "");
+  }
   get documentURI() { return this.URL; }
   get domain() {
     return this === globalThis.document
@@ -5676,7 +5683,10 @@ class Document extends Node {
   get referrer() { return _domParse("document_referrer") ?? ""; }
   get location() { return globalThis.location; }
   set location(url) { __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
-  get defaultView() { return globalThis; }
+  get defaultView() {
+    const get = _documentRealmMember(this, 'defaultView');
+    return get ? Reflect.apply(get, this, []) : globalThis;
+  }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
@@ -5708,7 +5718,10 @@ class Document extends Node {
     if (/\.(?:xml|svg)(?:[?#]|$)/i.test(url)) return "application/xml";
     return "text/html";
   }
-  get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
+  get readyState() {
+    const get = _documentRealmMember(this, 'readyState');
+    return get ? Reflect.apply(get, this, []) : (globalThis.__documentReadyState__ || 'complete');
+  }
   get currentScript() {
     // Next.js / Turbopack chunk loader reads document.currentScript.src to
     // derive its base path. page.rs sets __currentScriptNid before each
@@ -5719,11 +5732,18 @@ class Document extends Node {
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) {
+    const method = _documentRealmMember(this, 'getElementById');
+    if (method) return Reflect.apply(method, this, [id]);
     const needle = String(id);
     return needle === "" ? null : _wrapEl(+_dom("get_element_by_id", needle));
   }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) {
+    const method = _documentRealmMember(this, 'querySelector');
+    return method ? Reflect.apply(method, this, [s]) : _wrapEl(+_dom("query_selector", s));
+  }
   querySelectorAll(s) {
+    const method = _documentRealmMember(this, 'querySelectorAll');
+    if (method) return Reflect.apply(method, this, [s]);
     const ids = _domParse("query_selector_all", s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
@@ -6216,8 +6236,12 @@ class Document extends Node {
     this.write(args.join('') + '\n');
   }
   open() {
-    if (this.head) this.head.innerHTML = '';
-    var body = this.body;
+    const method = _documentRealmMember(this, 'open');
+    if (method) return Reflect.apply(method, this, []);
+    // Native algorithms use the receiver's tree, not script-overridden getters.
+    const head = _wrapEl(+_dom('query_selector', 'head'));
+    if (head) head.innerHTML = '';
+    const body = _wrapEl(+_dom('query_selector', 'body'));
     if (body) body.innerHTML = '';
     // A new parse begins. Whatever the input stream still held is gone.
     _dom("document_write_reset");
@@ -6230,6 +6254,8 @@ class Document extends Node {
     return this;
   }
   close() {
+    const method = _documentRealmMember(this, 'close');
+    if (method) return Reflect.apply(method, this, []);
     if (!this._writeOpen) return;
     this._writeOpen = false;
     const generation = this._writeGeneration;
@@ -6256,6 +6282,18 @@ class Document extends Node {
   }
   hasFocus() { return true; }
   execCommand() { return false; }
+}
+
+// Preserve the receiver realm's implementations even if a membrane remaps the
+// document's public prototype. The ordinary own-document path makes no op call.
+const _documentMembers = Object.freeze(Object.fromEntries(
+  ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close'].map(name => {
+    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+    return [name, descriptor.value || descriptor.get];
+  })));
+function _documentRealmMember(receiver, name) {
+  return receiver === globalThis.document ? undefined
+    : __obscuraCore.ops.op_document_realm_member(receiver, name, _realmFrameId);
 }
 
 class DocumentFragment extends Node {
@@ -13270,7 +13308,7 @@ globalThis.__obscura_forgetFrame = function (frameId) {
 };
 
 function _realmOrigin() {
-  try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
+  return _domParse('document_origin') || 'null';
 }
 
 // Whether a postMessage restricted to `targetOrigin` may be delivered to a
@@ -13303,8 +13341,20 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   // An unspecified targetOrigin stays permissive (empty string); the receiver
   // enforces a specified one against its own origin in __obscura_deliverMessage.
   const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
-  __obscuraCore.ops.op_post_frame_message(
-    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), to, json);
+  if (__obscuraCore.ops.op_post_frame_message(targetFrameId >>> 0, to, json)) return;
+  // Top-level self-posts also work in a standalone runtime without a Page to
+  // drain cross-realm messages. Serialize only once, before scheduling.
+  const origin = _realmOrigin();
+  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
+  const clone = JSON.parse(json).v;
+  setTimeout(() => {
+    try {
+      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+        new MessageEvent('message', { data: clone, origin, source: globalThis })));
+    } catch (error) {
+      console.error('message listener failed:', error && error.message || error);
+    }
+  }, 0);
 }
 
 // The frame's own window and document, when this page is allowed to touch
@@ -13322,6 +13372,44 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
+function _ensureInitialFrameRealm(element) {
+  if (element._frameId || !element.isConnected) return;
+  // An opaque sandbox must never receive the creator's security token.
+  if (element.hasAttribute('sandbox') &&
+      !element.getAttribute('sandbox').split(/\s+/).includes('allow-same-origin')) return;
+  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id) => {
+    const core = child.__obscura_core_handoff;
+    for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
+    delete child.__obscura_core_handoff;
+    delete child.Deno;
+    for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
+                       '__obscura_ua_platform_version', '__obscura_stealth',
+                       '__obscura_geo_lat', '__obscura_geo_lon']) {
+      if (globalThis[name] !== undefined) child[name] = globalThis[name];
+    }
+    child.__obscura_frameId = id;
+    child.__obscura_parentFrameId = _realmFrameId;
+    child.__obscura_init();
+    Object.defineProperties(child, {
+      parent: { value: globalThis, configurable: true },
+      top: { value: globalThis.top, configurable: true },
+      frameElement: { value: element, configurable: true },
+    });
+    child.innerWidth = 300;
+    child.innerHeight = 150;
+    globalThis.__obscura_frameObjects[id] = {
+      window: child, document: child.document, initial: true,
+    };
+  });
+  if (frameId) {
+    element._frameId = frameId;
+    element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
+    element._iframeDoc = globalThis.__obscura_frameObjects[frameId].document;
+    globalThis.__obscura_frameElements[frameId] = element;
+  }
+  return frameId !== 0;
+}
+
 // The window object this realm uses to stand for frame `frameId`, built once
 // and reused so `event.source === iframe.contentWindow` holds.
 //
@@ -13334,6 +13422,7 @@ function _frameWindowFor(frameId) {
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
   if (!real) return existing || null;
+  if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
   const post = _markNative(function (data, targetOrigin, _transfer) {
@@ -14653,26 +14742,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
 globalThis.postMessage = function(data, targetOrigin, _transfer) {
-  let clone = data;
-  // Match the cross-realm path: a value postMessage cannot carry is rejected
-  // at the call, not delivered as something else.
-  try {
-    clone = JSON.parse(JSON.stringify({ v: data === undefined ? null : data })).v;
-  } catch (_) {
-    throw new DOMException('The object could not be cloned.', 'DataCloneError');
-  }
-  const origin = _realmOrigin();
-  // A self-post honours targetOrigin too: sender and receiver are this realm,
-  // so a targetOrigin naming a different origin drops the message.
-  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
-  setTimeout(() => {
-    try {
-      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-        new MessageEvent('message', { data: clone, origin, source: globalThis })));
-    } catch (error) {
-      console.error('message listener failed:', error && error.message || error);
-    }
-  }, 0);
+  _sendRealmMessage(_realmFrameId, data, targetOrigin);
 };
 _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
@@ -16070,6 +16140,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  __obscuraCore.ops.op_register_document_realm(_documentMembers, _realmFrameId);
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);

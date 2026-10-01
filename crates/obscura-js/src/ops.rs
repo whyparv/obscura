@@ -111,6 +111,9 @@ pub(crate) struct CanvasBackingSurface {
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
+    /// Initial about:blank documents retain their creator's base URL and origin.
+    pub(crate) about_base_url: Option<String>,
+    pub(crate) inherited_origin: Option<String>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
@@ -351,12 +354,32 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
+    pub(crate) fn inherit_resources(&mut self, parent: &Self) {
+        self.cookie_jar = parent.cookie_jar.clone();
+        self.http_client = parent.http_client.clone();
+        self.callbacks = parent.callbacks.clone();
+        self.encoding = parent.encoding.clone();
+        self.blocked_urls = parent.blocked_urls.clone();
+        self.intercept_enabled = parent.intercept_enabled;
+        self.page_in_flight = parent.page_in_flight.clone();
+        #[cfg(feature = "stealth")]
+        {
+            self.stealth_client = parent.stealth_client.clone();
+        }
+        #[cfg(feature = "render")]
+        if has_page_transport(parent) {
+            self.render_resources.set_sync_loading_enabled(false);
+        }
+    }
+
     pub fn new() -> Self {
         #[cfg(feature = "render")]
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
+            about_base_url: None,
+            inherited_origin: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
@@ -658,6 +681,18 @@ pub struct RealmStates {
 }
 
 impl RealmStates {
+    pub(crate) fn live_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn context(&self, frame_id: u32) -> Option<v8::Global<v8::Context>> {
+        self.entries.iter().find(|(_, id, _)| *id == frame_id)
+            .map(|(context, _, _)| context.clone())
+    }
+
+    pub(crate) fn forget_frame(&mut self, frame_id: u32) {
+        self.entries.retain(|(_, id, _)| *id != frame_id);
+    }
     pub fn register(
         &mut self,
         context: v8::Global<v8::Context>,
@@ -671,7 +706,7 @@ impl RealmStates {
         self.entries.retain(|(known, _, _)| known != context);
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
@@ -1785,6 +1820,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "document_origin" => serde_json::to_string(&gs.inherited_origin.clone().unwrap_or_else(|| {
+            url::Url::parse(&gs.url).map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|_| "null".to_string())
+        })).unwrap_or("\"null\"".into()),
         // The base for relative URLs. It differs from document_url exactly when the page carries
         // a <base href>, and that is the point: HTML resolves against the base, not the document.
         "document_base_url" => serde_json::to_string(
@@ -5249,13 +5288,23 @@ fn frame_message_queue_byte_limit() -> usize {
 // handshake actually depends on.
 #[op2(fast)]
 fn op_post_frame_message(
+    scope: &mut v8::PinScope,
     state: &OpState,
     target_frame_id: u32,
-    source_frame_id: u32,
-    #[string] origin: &str,
     #[string] target_origin: &str,
     #[string] data_json: &str,
-) {
+) -> bool {
+    let source = realm_state(scope, state);
+    let source = source.borrow();
+    let source_frame_id = source.frame_id;
+    if source_frame_id == 0 && target_frame_id == 0 {
+        return false; // The page's self-post uses its existing local task queue.
+    }
+    let origin = source.inherited_origin.clone().unwrap_or_else(|| {
+        url::Url::parse(&source.url).map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "null".to_string())
+    });
+    drop(source);
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     let over_entries = gs.pending_frame_messages.len() >= frame_message_queue_entry_limit();
@@ -5270,7 +5319,7 @@ fn op_post_frame_message(
             gs.pending_frame_messages.len(),
             gs.pending_frame_message_bytes,
         );
-        return;
+        return true;
     }
     gs.pending_frame_message_bytes = gs
         .pending_frame_message_bytes
@@ -5278,10 +5327,11 @@ fn op_post_frame_message(
     gs.pending_frame_messages.push(PendingFrameMessage {
         target_frame_id,
         source_frame_id,
-        origin: origin.to_string(),
+        origin,
         target_origin: target_origin.to_string(),
         data_json: data_json.to_string(),
     });
+    true
 }
 
 /// Resolves after `millis`, as the timer source for child frame realms.
@@ -5343,6 +5393,122 @@ fn op_frame_document_ready(
         parent_frame_id,
     });
     frame_id
+}
+
+// deno_core owns the context-state and module-map slots. Store traced V8 values
+// after them, not Global handles that would keep the context alive after detach.
+const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
+const DOCUMENT_OWNER_SLOT: i32 = DOCUMENT_MEMBERS_SLOT + 1;
+
+#[op2(nofast)]
+fn op_register_document_realm(
+    scope: &mut v8::PinScope,
+    members: v8::Local<v8::Object>,
+    frame_id: u32,
+) {
+    if let Some(context) = members.get_creation_context(scope) {
+        context.set_embedder_data(DOCUMENT_MEMBERS_SLOT, members.into());
+        let id = v8::Integer::new_from_unsigned(scope, frame_id);
+        context.set_embedder_data(DOCUMENT_OWNER_SLOT, id.into());
+    }
+}
+
+/// Resolve a borrowed document member from the receiver's creation realm, not
+/// its public prototype, which a membrane is allowed to replace.
+#[op2]
+fn op_document_realm_member<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    receiver: v8::Local<'s, v8::Object>,
+    #[string] name: &str,
+    caller_frame_id: u32,
+) -> v8::Local<'s, v8::Value> {
+    let member = (|| {
+        let context = receiver.get_creation_context(scope)?;
+        let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
+        if owner == caller_frame_id { return None; }
+        let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
+        let key = v8::String::new(scope, name)?;
+        let value = members.get(scope, key.into())?;
+        value.is_function().then_some(value)
+    })();
+    member.unwrap_or_else(|| v8::undefined(scope).into())
+}
+
+/// Limit live contexts and DOM trees, including initial realms awaiting Page
+/// adoption. Synchronous and fetched frames share the same per-page budget.
+pub fn max_live_frames() -> usize {
+    std::env::var("OBSCURA_MAX_LIVE_FRAMES").ok()
+        .and_then(|value| value.parse().ok()).unwrap_or(64)
+}
+
+/// An initial about:blank needs its own realm before the next JS statement.
+#[op2(nofast)]
+fn op_initial_frame(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    parent_frame_id: u32,
+    initialize: v8::Local<v8::Function>,
+) -> u32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
+        let page = state.borrow::<SharedState>().clone();
+        let parent_state = frame_state(state, parent_frame_id);
+        if registry.borrow().live_count() >= max_live_frames()
+            || page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
+            || page.borrow().pending_frame_bytes.saturating_add("about:blank".len()) > MAX_PENDING_FRAME_BYTES
+        {
+            return 0;
+        }
+        let Some(frame_id) = page.borrow().frame_id_counter.checked_add(1) else { return 0 };
+        page.borrow_mut().frame_id_counter = frame_id;
+        let Some(parent_context) = initialize.get_creation_context(scope) else { return 0 };
+        let main_context = scope.get_current_context();
+        let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
+            .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
+        else { return 0 };
+        // Same borrowed deno_core slots as fetched frame realms. Child contexts
+        // must not own or free these pointers.
+        unsafe {
+            for index in [deno_core::CONTEXT_STATE_SLOT_INDEX, deno_core::MODULE_MAP_SLOT_INDEX] {
+                let pointer = main_context.get_aligned_pointer_from_embedder_data(index);
+                context.set_aligned_pointer_in_embedder_data(index, pointer);
+            }
+        }
+        context.set_security_token(parent_context.get_security_token(scope));
+        let mut child = ObscuraState::new();
+        {
+            let parent = parent_state.borrow();
+            child.dom = Some(obscura_dom::parse_html(
+                "<!DOCTYPE html><html><head></head><body></body></html>"));
+            child.frame_id = frame_id;
+            child.about_base_url = document_base_url(&parent);
+            child.inherited_origin = Some(parent.inherited_origin.clone().unwrap_or_else(|| {
+                url::Url::parse(&parent.url).map(|url| url.origin().ascii_serialization())
+                    .unwrap_or_else(|_| "null".to_string())
+            }));
+            child.inherit_resources(&parent);
+        }
+        let handle = v8::Global::new(scope, context);
+        registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
+        let window = context.global(scope);
+        let id = v8::Integer::new_from_unsigned(scope, frame_id);
+        let receiver = v8::undefined(scope);
+        if initialize.call(scope, receiver.into(), &[window.into(), id.into()]).is_none() {
+            registry.borrow_mut().forget(&handle);
+            return 0;
+        }
+        let mut page = page.borrow_mut();
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add("about:blank".len());
+        page.pending_frames.push(PendingFrame {
+            frame_id,
+            parent_frame_id,
+            url: "about:blank".to_string(),
+            html: String::new(),
+            viewport_width: 300,
+            viewport_height: 150,
+        });
+        frame_id
+    })).unwrap_or(0)
 }
 
 /// Whether async host work can be scheduled without aborting the isolate.
@@ -6242,6 +6408,9 @@ pub fn build_extension() -> Extension {
         op_session_history(),
         op_history_traverse(),
         op_frame_document_ready(),
+        op_initial_frame(),
+        op_document_realm_member(),
+        op_register_document_realm(),
         op_post_frame_message(),
         op_sleep(),
         op_async_runtime_available(),
@@ -6467,7 +6636,7 @@ fn op_waapi_control(state: &OpState, id: f64, #[string] action: &str, value: f64
 // Not tied to `render`: the JS layer resolves every relative URL through here, in all build
 // variants.
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
-    let document_url = url::Url::parse(&state.url).ok()?;
+    let document_url = url::Url::parse(state.about_base_url.as_deref().unwrap_or(&state.url)).ok()?;
     let base_href = state.dom.as_ref().and_then(|dom| {
         dom.query_selector("base[href]")
             .ok()

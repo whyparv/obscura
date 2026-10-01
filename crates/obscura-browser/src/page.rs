@@ -3,6 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
+use obscura_js::ops::max_live_frames;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -342,18 +343,6 @@ pub struct Page {
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
-
-/// How many child frame realms one document may hold at once.
-///
-/// Real pages use a handful; the cap exists so a page that creates iframes in a
-/// loop cannot make the engine hold an unbounded number of contexts and DOM
-/// trees. Frames are released when the document is replaced.
-fn max_live_frames() -> usize {
-    std::env::var("OBSCURA_MAX_LIVE_FRAMES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(64)
-}
 
 /// The first navigation counts. The low default stops a page that resets
 /// `location` on every load.
@@ -1413,6 +1402,9 @@ impl Page {
     /// page's same-origin frame table. This also covers a frame rejected before
     /// a `FrameRealm` exists, so the normal drop path cannot be skipped.
     fn forget_frame_references(&mut self, frame_id: u32, parent_frame_id: u32) {
+        if let Some(js) = self.js.as_mut() {
+            js.forget_frame_state(frame_id);
+        }
         let script = format!(
             "if (globalThis.__obscura_frameElements[{frame_id}] &&\
              globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
