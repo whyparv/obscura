@@ -536,6 +536,16 @@ impl ObscuraJsRuntime {
         EnteredRuntime(&mut self.js_runtime)
     }
 
+    /// Read native isolate statistics without evaluating scripts or forcing GC.
+    pub fn heap_statistics(&mut self) -> v8::HeapStatistics {
+        self.runtime().v8_isolate().get_heap_statistics()
+    }
+
+    /// Run a full collection only when an automation client explicitly asks.
+    pub fn collect_garbage(&mut self) {
+        self.runtime().v8_isolate().low_memory_notification();
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
