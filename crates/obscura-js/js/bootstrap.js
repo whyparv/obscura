@@ -6317,11 +6317,6 @@ class Document extends Node {
 
 // Preserve the receiver realm's implementations even if a membrane remaps the
 // document's public prototype. The ordinary own-document path makes no op call.
-const _documentMembers = Object.freeze(Object.fromEntries(
-  ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close'].map(name => {
-    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
-    return [name, descriptor.value || descriptor.get];
-  })));
 function _documentRealmMember(receiver, name) {
   return receiver === globalThis.document ? undefined
     : __obscuraCore.ops.op_document_realm_member(receiver, name, _realmFrameId);
@@ -16088,6 +16083,8 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // querySelectorAll returns tree order, which also makes descendants and
   // later siblings replace the matching boxes behind them.
   Document.prototype.elementFromPoint = function(x, y) {
+    const method = _documentRealmMember(this, 'elementFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
     }
@@ -16180,6 +16177,13 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     return Document.prototype.elementsFromPoint.call(globalThis.document || this, x, y);
   };
 }
+
+// Capture late-defined document members too, before page code can replace them.
+const _documentMembers = Object.freeze(Object.fromEntries(
+  ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
+    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+    return [name, descriptor.value || descriptor.get];
+  })));
 
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.

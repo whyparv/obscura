@@ -4991,6 +4991,29 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn borrowed_document_hit_testing_uses_the_receiver_realm() {
+        let mut rt = setup_runtime(
+            "<style>body{margin:4px}#parent{width:45px;height:30px}</style><div id='parent'></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<style>body{margin:8px}div{width:100px;height:20px}</style><div id="child"></div>';
+            const child = d.getElementById('child'), parent = document.getElementById('parent');
+            const foreign = iframe.contentWindow.Document.prototype;
+            return [document.elementFromPoint(10, 10) === parent,
+                d.elementFromPoint(10, 10) === child,
+                Document.prototype.elementFromPoint.call(d, 10, 10) === child,
+                foreign.elementFromPoint.call(document, 10, 10) === parent,
+                Document.prototype.elementFromPoint.call(d, 400, 10) === null,
+                foreign.elementFromPoint.call(document, 400, 10) === document.body,
+                Document.prototype.elementsFromPoint.call(d, 10, 10)[0] === child,
+                foreign.elementsFromPoint.call(document, 10, 10)[0] === parent];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true, true, true, true, true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn computed_style_on_a_foreign_frame_element_tracks_its_document() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"(() => {
