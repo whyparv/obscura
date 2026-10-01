@@ -154,6 +154,10 @@ const _dom = (cmd, a1, a2) => {
   // not make JS believe a move happened.
   if (result === "true" && _DOM_TREE_MUTATION_COMMANDS.has(cmd)) {
     _treeMutationEpoch++;
+    // HTML removal steps reset the focused area to the viewport without
+    // dispatching blur/change events. Cover native replacement paths too.
+    const focused = globalThis.__obscura_focused;
+    if (focused && !focused.isConnected) globalThis.__obscura_focused = null;
   }
   return result;
 };
@@ -5259,23 +5263,22 @@ class Element extends Node {
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView(arg) {
-    globalThis.__obscura_click_target = this;
-    const rect = this.getBoundingClientRect();
-    // A viewport-fixed subtree is already expressed in the viewport's
-    // coordinate space and cannot be brought closer by moving the document.
-    if (rect.__obscuraViewportFixed) return;
-
     let block = "start", inline = "nearest";
     if (arg === false) block = "end";
     else if (arg && typeof arg === "object") {
       if (["start", "center", "end", "nearest"].includes(arg.block)) block = arg.block;
       if (["start", "center", "end", "nearest"].includes(arg.inline)) inline = arg.inline;
     }
-    const currentX = globalThis.scrollX || 0;
-    const currentY = globalThis.scrollY || 0;
-    const vw = globalThis.innerWidth || 1280;
-    const vh = globalThis.innerHeight || 720;
+    this._scrollIntoView(block, inline, false, arg && arg.behavior);
+  }
+  scrollIntoViewIfNeeded(centerIfNeeded = true) {
+    const alignment = centerIfNeeded ? "center" : "nearest";
+    this._scrollIntoView(alignment, alignment, true);
+  }
+  _scrollIntoView(block, inline, onlyIfNeeded, behavior) {
+    globalThis.__obscura_click_target = this;
     const align = (mode, start, end, size, viewportSize, current) => {
+      if (onlyIfNeeded && start >= 0 && end <= viewportSize) return current;
       if (mode === "start") return current + start;
       if (mode === "center") return current + start - (viewportSize - size) / 2;
       if (mode === "end") return current + end - viewportSize;
@@ -5284,13 +5287,41 @@ class Element extends Node {
       if ((start >= 0 && end <= viewportSize) || (start < 0 && end > viewportSize)) {
         return current;
       }
-      if (start < 0) return current + start;
-      if (end > viewportSize) return current + end - viewportSize;
+      if (start < 0) return current + (size <= viewportSize ? start : end - viewportSize);
+      if (end > viewportSize) return current + (size <= viewportSize ? end - viewportSize : start);
       return current;
     };
+    // Use the renderer's retained scroll ranges, not overflow guesses. A
+    // clipped/non-scrolling box has zero range even when descendants overflow.
+    const viewportFixed = this.getBoundingClientRect().__obscuraViewportFixed;
+    for (let ancestor = this.parentElement;
+         typeof __obscuraCore.ops.op_element_scroll_metrics === 'function' && ancestor && !ancestor._isViewportRoot();
+         ancestor = ancestor.parentElement) {
+      const metrics = ancestor._renderElementScrollMetrics();
+      if (metrics && (metrics.maxX > 0 || metrics.maxY > 0)) {
+        const rect = this.getBoundingClientRect();
+        const port = ancestor.getBoundingClientRect();
+        const x = port.left + ancestor.clientLeft;
+        const y = port.top + ancestor.clientTop;
+        ancestor.scrollTo({
+          left: align(inline, rect.left - x, rect.right - x, rect.width, metrics.clientWidth, metrics.x),
+          top: align(block, rect.top - y, rect.bottom - y, rect.height, metrics.clientHeight, metrics.y),
+          behavior,
+        });
+      }
+      // A fixed scrollport can scroll its contents, but moving ancestors
+      // outside its fixed containing block cannot bring the target into view.
+      if (viewportFixed && globalThis.getComputedStyle(ancestor).position === 'fixed') break;
+    }
+    const rect = this.getBoundingClientRect();
+    if (rect.__obscuraViewportFixed) return;
+    const currentX = globalThis.scrollX || 0;
+    const currentY = globalThis.scrollY || 0;
+    const vw = globalThis.innerWidth || 1280;
+    const vh = globalThis.innerHeight || 720;
     const left = align(inline, rect.left, rect.right, rect.width, vw, currentX);
     const top = align(block, rect.top, rect.bottom, rect.height, vh, currentY);
-    globalThis.scrollTo({ left, top, behavior: arg && arg.behavior });
+    globalThis.scrollTo({ left, top, behavior });
   }
   // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
   // The setters fire a scroll event of their own, so suppress the per-axis ones
