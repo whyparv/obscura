@@ -20,12 +20,12 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, RuntimeEvent, RuntimeExceptionEvent, StoredNetworkResponseBody, build_extension,
-    node_is_script,
+    ObscuraState, RuntimeEvent, RuntimeExceptionEvent, StoredNetworkResponseBody,
+    begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
 use crate::ops::{
-    begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
+    clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
 
 #[cfg(feature = "render")]
@@ -545,7 +545,6 @@ impl ObscuraJsRuntime {
         // heap-limit termination before any later task enters V8 even when the
         // caller that triggered it did not need the error value.
         self.recover_heap_limit();
-        #[cfg(feature = "render")]
         begin_animation_task(&mut self.state.borrow_mut());
     }
     pub fn new() -> Self {
@@ -3507,10 +3506,9 @@ impl ObscuraJsRuntime {
                 Ok(Ok(false)) => {
                     // End-of-task microtasks belong to this turn, but work
                     // queued from them belongs to a subsequent cooperative
-                    // turn. Yield so the wall deadline remains observable even
-                    // when every turn immediately schedules another one.
+                    // turn. The cooperative helper yields to Tokio even when
+                    // every turn immediately schedules another one.
                     self.runtime().v8_isolate().perform_microtask_checkpoint();
-                    tokio::task::yield_now().await;
                 }
                 Ok(Err(error)) => {
                     if is_fatal_event_loop_error(&error) {
@@ -3551,15 +3549,16 @@ impl ObscuraJsRuntime {
         self.run_event_loop_bounded(budget_ms).await
     }
 
-    /// Drive one deno_core event-loop tick at a time. When the first tick
-    /// parks, process one more tick after its registered waker fires, then
-    /// yield back to the embedder even if that tick schedules more work.
+    /// Return after a poll that delivers browser tasks. If the first poll
+    /// has no ready task, wait for its registered waker and process one more
+    /// poll before returning, including V8 maintenance wakes. Busy turns also
+    /// yield to Tokio so every caller can make network and timer progress.
     ///
     /// `JsRuntime::run_event_loop()` is a run-to-idle future. When a page keeps
     /// it continuously ready (zero-delay schedulers, streaming traffic, or a
     /// framework work queue), Tokio never regains control to observe a timeout
-    /// or our readiness policy. This future deliberately turns the wake for a
-    /// second tick into a return to the caller. If no work is immediately
+    /// or our readiness policy. A pending poll can already have delivered a
+    /// task; do not await another wake in that case. If no work is immediately
     /// ready, it remains parked on deno_core's real I/O/timer waker, so the
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
@@ -3567,6 +3566,7 @@ impl ObscuraJsRuntime {
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
+            let task_generation = self.state.borrow().animation_task_generation;
             let tick = self
                 .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
@@ -3575,7 +3575,11 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => {
                     std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
-                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
+                std::task::Poll::Pending if waiting_for_wake
+                    || self.state.borrow().animation_task_generation != task_generation =>
+                {
+                    std::task::Poll::Ready(Ok(false))
+                }
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -3583,6 +3587,9 @@ impl ObscuraJsRuntime {
             }
         })
         .await;
+        if matches!(result, Ok(false)) {
+            tokio::task::yield_now().await;
+        }
         self.finish_heap_checked(result)
     }
 
@@ -3622,6 +3629,7 @@ impl ObscuraJsRuntime {
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
+            let task_generation = self.state.borrow().animation_task_generation;
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
@@ -3650,7 +3658,11 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => {
                     std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
-                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
+                std::task::Poll::Pending if waiting_for_wake
+                    || self.state.borrow().animation_task_generation != task_generation =>
+                {
+                    std::task::Poll::Ready(Ok(false))
+                }
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -3658,6 +3670,9 @@ impl ObscuraJsRuntime {
             }
         })
         .await;
+        if matches!(result, Ok(false)) {
+            tokio::task::yield_now().await;
+        }
         self.finish_heap_checked(result)
     }
 
@@ -8205,6 +8220,68 @@ mod tests {
             "clearInterval(globalThis.__zeroInterval)",
         )
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_interval_yields_before_polling_v8_again() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "ready-interval",
+            "globalThis.__readyTicks = 0;\
+             globalThis.__readyInterval = setInterval(() => __readyTicks++, 0);",
+        ).unwrap();
+
+        for (autonomous, expected_ticks) in [(true, 1.0), (false, 2.0)] {
+            // Make the timer due before the first poll. Even if the future
+            // yields to Tokio, resuming it must not deliver another tick.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let result = {
+                let mut turn: Pin<Box<dyn Future<Output = Result<bool, String>> + '_>> =
+                    if autonomous {
+                        Box::pin(rt.run_autonomous_event_loop_turn())
+                    } else {
+                        Box::pin(rt.run_cooperative_event_loop_tick())
+                    };
+                match std::future::poll_fn(|cx| Poll::Ready(turn.as_mut().poll(cx))).await {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        turn.await
+                    }
+                }
+            };
+            result.unwrap();
+            assert_eq!(rt.evaluate("__readyTicks").unwrap(), serde_json::json!(expected_ticks));
+        }
+        rt.execute_script("clear-ready-interval", "clearInterval(__readyInterval)").unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn adaptive_settle_yields_to_tokio_during_ready_posted_tasks() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let awake = Arc::new(AtomicBool::new(false));
+        let observed = awake.clone();
+        let heartbeat = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            observed.store(true, Ordering::Relaxed);
+        });
+        tokio::task::yield_now().await;
+        rt.execute_script("ready-posted-tasks", r#"
+            const channel = new MessageChannel();
+            const deadline = Date.now() + 1000;
+            globalThis.__settleMessages = 0;
+            channel.port1.onmessage = () => {
+                __settleMessages++;
+                if (Date.now() < deadline) channel.port2.postMessage(null);
+            };
+            channel.port2.postMessage(null);
+        "#).unwrap();
+        rt.run_event_loop_until_quiescent(100, 30).await.unwrap();
+        heartbeat.abort();
+        assert!(awake.load(Ordering::Relaxed),
+            "adaptive settle starved Tokio while page tasks stayed ready");
+        assert!(rt.evaluate("__settleMessages > 0").unwrap().as_bool().unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]
