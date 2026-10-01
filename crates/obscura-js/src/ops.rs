@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deno_core::Extension;
 use deno_core::JsBuffer;
 use deno_core::OpState;
+use deno_core::{AsyncResult, CancelFuture, CancelHandle, Resource};
 use deno_core::op2;
 use deno_core::v8;
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
@@ -687,6 +688,65 @@ async fn read_body_capped(
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
+impl Drop for PageInFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+struct FetchBodyResource {
+    body: RefCell<Option<AsyncResult<Vec<u8>>>>,
+    cancel: Rc<CancelHandle>,
+    opaque: bool,
+}
+
+impl Resource for FetchBodyResource {
+    fn close(self: Rc<Self>) {
+        self.cancel.cancel();
+        self.body.borrow_mut().take();
+    }
+}
+
+#[op2]
+#[buffer]
+async fn op_fetch_body(
+    state: Rc<RefCell<OpState>>,
+    rid: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let resource = state.borrow().resource_table.get::<FetchBodyResource>(rid)
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+    let body = resource.body.borrow_mut().take()
+        .ok_or_else(|| deno_error::JsErrorBox::type_error("Body is already consumed"))?;
+    let result = body.or_cancel(resource.cancel.clone()).await
+        .map_err(|_| deno_error::JsErrorBox::generic("Response body was cancelled"));
+    let closed = state.borrow_mut().resource_table.take_any(rid);
+    if let Ok(resource) = closed {
+        resource.close();
+    }
+    result?.map(|bytes| if resource.opaque { Vec::new() } else { bytes })
+}
+
+async fn fetch_body_result(
+    state: &RefCell<OpState>,
+    mut metadata: serde_json::Value,
+    body: AsyncResult<Vec<u8>>,
+    internal_load: bool,
+) -> Result<String, deno_error::JsErrorBox> {
+    if internal_load {
+        let bytes = body.await?;
+        metadata["body"] = serde_json::json!(String::from_utf8_lossy(&bytes));
+        metadata["bodyBase64"] = serde_json::json!(BASE64.encode(&bytes));
+    } else {
+        let rid = state.borrow_mut().resource_table.add(FetchBodyResource {
+            body: RefCell::new(Some(body)), cancel: CancelHandle::new_rc(),
+            opaque: metadata["opaque"].as_bool().unwrap_or(false),
+        });
+        metadata["bodyRid"] = serde_json::json!(rid);
+    }
+    Ok(metadata.to_string())
 }
 
 /// Cap on the append-only `fetched_urls` asset list. A page can otherwise loop
@@ -3216,12 +3276,6 @@ async fn op_fetch_url(
         })
         .to_string());
     }
-    struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
-    impl Drop for PageInFlightGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
     let credentials = FetchCredentials::parse(&credentials);
@@ -3488,6 +3542,8 @@ async fn op_fetch_url(
         };
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
+                state.clone(),
+                _page_in_flight,
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
@@ -3735,42 +3791,6 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
-    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
-    let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_response_callbacks().await {
-            let resp = fetch_response(
-                current_url.as_str(),
-                status,
-                resp_headers.clone(),
-                resp_bytes.to_vec(),
-                redirected_from,
-            );
-            let info = RequestInfo {
-                url: resp.url.clone(),
-                method: current_method.as_str().to_string(),
-                headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
-            };
-            cbs.fire_response(&info, &resp).await;
-        }
-    }
-    record_js_network_completion(&state, JsNetworkEvent {
-        request_id: request_id.clone(), intercepted: was_intercepted,
-        url: current_url.clone(), method: current_method.as_str().to_string(), status,
-        response_headers: resp_headers.clone(), body_size: resp_bytes.len(),
-        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_secs_f64(),
-    }, &resp_body, false);
-
-    tracing::debug!(
-        "op_fetch_url completed: {} {} ({} bytes)",
-        method,
-        url,
-        resp_body.len()
-    );
-
     let opaque = !internal_load && mode == "no-cors" && crossed_origin;
     let script_headers = if opaque {
         HashMap::new()
@@ -3778,17 +3798,45 @@ async fn op_fetch_url(
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
 
-    Ok(serde_json::json!({
+    let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
-        "body": if opaque { String::new() } else { resp_body },
-        "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
         "requestId": request_id,
         "url": current_url,
         "redirected": redirected,
         "opaque": opaque,
         "headers": script_headers,
-    })
-    .to_string())
+    });
+    // A resource must not form an ownership cycle with its OpState table.
+    let body_state = Rc::downgrade(&state);
+    let body = Box::pin(async move {
+        let _page_in_flight = _page_in_flight;
+        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        if let Some(ref cbs) = callbacks {
+            if cbs.has_response_callbacks().await {
+                let resp = fetch_response(
+                    current_url.as_str(), status, resp_headers.clone(),
+                    resp_bytes.to_vec(), redirected_from,
+                );
+                let info = RequestInfo {
+                    url: resp.url.clone(), method: current_method.as_str().to_string(),
+                    headers: resp_headers.clone(), resource_type: ResourceType::Fetch,
+                };
+                cbs.fire_response(&info, &resp).await;
+            }
+        }
+        if let Some(state) = body_state.upgrade() {
+            record_js_network_completion(&state, JsNetworkEvent {
+                request_id, intercepted: was_intercepted,
+                url: current_url, method: current_method.as_str().to_string(), status,
+                response_headers: resp_headers, body_size: resp_bytes.len(),
+                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64(),
+            }, &String::from_utf8_lossy(&resp_bytes), false);
+        }
+        tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
+        Ok(resp_bytes)
+    });
+    fetch_body_result(&state, metadata, body, internal_load).await
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -3818,6 +3866,8 @@ fn fetch_response(
 /// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
+    state: Rc<RefCell<OpState>>,
+    page_in_flight: PageInFlightGuard,
     stealth: Arc<StealthHttpClient>,
     url: String,
     method: String,
@@ -3843,7 +3893,7 @@ async fn stealth_fetch_all(
         .unwrap_or(false);
     let cookie_initiator = url::Url::parse(&page_origin).ok();
 
-    let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
+    let response = loop {
         let parsed_current = match url::Url::parse(&current_url) {
             Ok(u) => u,
             Err(_) => {
@@ -3876,19 +3926,20 @@ async fn stealth_fetch_all(
             }
         });
         let r = stealth
-            .send_single_with_context(
+            .send_single_headers_with_context(
                 &current_method,
                 &parsed_current,
                 &req_headers,
                 &current_body,
                 cookie_context,
                 credentials_allowed,
+                fetch_max_body_bytes().min(64 * 1024 * 1024),
             )
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
         if !(300..400).contains(&r.status) {
-            break (r.status, r.headers, r.body);
+            break r;
         }
         // Cross-origin redirect responses must pass the CORS check too, before
         // the redirect is followed (#973).
@@ -3916,11 +3967,11 @@ async fn stealth_fetch_all(
             }
         }
         let Some(location) = r.headers.get("location").cloned() else {
-            break (r.status, r.headers, r.body);
+            break r;
         };
         let next_url = match parsed_current.join(&location) {
             Ok(u) => u,
-            Err(_) => break (r.status, r.headers, r.body),
+            Err(_) => break r,
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
@@ -3954,6 +4005,8 @@ async fn stealth_fetch_all(
         current_url = next_url.to_string();
     };
 
+    let status = response.status;
+    let resp_headers = response.headers;
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
@@ -3986,27 +4039,6 @@ async fn stealth_fetch_all(
         }
     }
 
-    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
-    let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_response_callbacks().await {
-            let resp = fetch_response(
-                current_url.as_str(),
-                status,
-                resp_headers.clone(),
-                resp_bytes.clone(),
-                redirected_from,
-            );
-            let info = RequestInfo {
-                url: resp.url.clone(),
-                method: current_method.clone(),
-                headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
-            };
-            cbs.fire_response(&info, &resp).await;
-        }
-    }
-
     let opaque = !internal_load && mode == "no-cors" && crossed_origin;
     let script_headers = if opaque {
         HashMap::new()
@@ -4014,16 +4046,33 @@ async fn stealth_fetch_all(
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
 
-    Ok(serde_json::json!({
+    let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
-        "body": if opaque { String::new() } else { resp_body },
-        "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
         "url": current_url,
         "redirected": redirects_followed > 0,
         "opaque": opaque,
         "headers": script_headers,
-    })
-    .to_string())
+    });
+    let body = Box::pin(async move {
+        let _page_in_flight = page_in_flight;
+        let resp_bytes = response.body.await
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+        if let Some(ref cbs) = callbacks {
+            if cbs.has_response_callbacks().await {
+                let resp = fetch_response(
+                    current_url.as_str(), status, resp_headers.clone(),
+                    resp_bytes.clone(), redirected_from,
+                );
+                let info = RequestInfo {
+                    url: resp.url.clone(), method: current_method,
+                    headers: resp_headers, resource_type: ResourceType::Fetch,
+                };
+                cbs.fire_response(&info, &resp).await;
+            }
+        }
+        Ok(resp_bytes)
+    });
+    fetch_body_result(&state, metadata, body, internal_load).await
 }
 
 pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
@@ -6417,6 +6466,7 @@ pub fn build_extension() -> Extension {
         op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
+        op_fetch_body(),
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
