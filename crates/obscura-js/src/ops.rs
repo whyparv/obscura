@@ -218,9 +218,9 @@ pub struct ObscuraState {
     pub animation_timeline: obscura_render::AnimationTimelineState,
     #[cfg(feature = "render")]
     pub animation_timeline_origin: std::time::Instant,
-    /// Host/HTML task epoch for document-timeline sampling. Geometry and
-    /// computed-style reads within one task share one frozen animation frame.
-    #[cfg(feature = "render")]
+    /// Host/HTML task epoch for cooperative delivery and document-timeline
+    /// sampling. It remains available without rendering so a ready timer or
+    /// posted task returns control before the embedder polls again.
     pub animation_task_generation: u64,
     #[cfg(feature = "render")]
     pub animation_sampled_task_generation: u64,
@@ -402,7 +402,6 @@ impl ObscuraState {
             animation_timeline: obscura_render::AnimationTimelineState::default(),
             #[cfg(feature = "render")]
             animation_timeline_origin: std::time::Instant::now(),
-            #[cfg(feature = "render")]
             animation_task_generation: 0,
             #[cfg(feature = "render")]
             animation_sampled_task_generation: 0,
@@ -6265,12 +6264,12 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        op_begin_render_task(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
     {
-        ops.push(op_begin_render_task());
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
@@ -6759,12 +6758,10 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
     state.resolved_scroll = None;
 }
 
-#[cfg(feature = "render")]
 pub(crate) fn begin_animation_task(state: &mut ObscuraState) {
     state.animation_task_generation = state.animation_task_generation.wrapping_add(1);
 }
 
-#[cfg(feature = "render")]
 #[op2(fast)]
 fn op_begin_render_task(state: &OpState) {
     let shared = state.borrow::<SharedState>().clone();
