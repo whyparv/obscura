@@ -476,6 +476,16 @@ impl ObscuraState {
             document_write_inserted_script: Cell::new(false),
         }
     }
+    #[cfg(feature = "render")]
+    pub(crate) fn set_viewport(&mut self, width: f64, height: f64) {
+        let viewport = (width as f32, height as f32);
+        if self.viewport != viewport {
+            self.viewport = viewport;
+            self.prepared_render = None;
+            self.pending_style_mutations.clear();
+            self.resolved_scroll = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5479,6 +5489,8 @@ fn op_initial_frame(
         }
         context.set_security_token(parent_context.get_security_token(scope));
         let mut child = ObscuraState::new();
+        #[cfg(feature = "render")]
+        child.set_viewport(300.0, 150.0);
         {
             let parent = parent_state.borrow();
             child.dom = Some(obscura_dom::parse_html(
@@ -7405,8 +7417,8 @@ fn clamp_scroll_offset_for_consumer(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_geometry(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -7462,8 +7474,8 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_box_metrics(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_box_metrics(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -7489,8 +7501,8 @@ fn op_layout_box_metrics(state: &OpState, #[string] nid_str: String) -> String {
 /// point is outside the viewport or no rendered element contains it.
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_layout_hit_test(state: &OpState, x: f64, y: f64) -> i32 {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_hit_test(state: &OpState, x: f64, y: f64, frame_id: u32) -> i32 {
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -7523,13 +7535,13 @@ fn op_layout_hit_test(state: &OpState, x: f64, y: f64) -> i32 {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
+fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String, frame_id: u32) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -7588,13 +7600,13 @@ fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String)
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
+fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: String, frame_id: u32) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -7648,8 +7660,9 @@ fn op_computed_style(
     #[string] nid_str: String,
     #[string] pseudo: String,
     #[string] property: String,
+    frame_id: u32,
 ) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -7728,8 +7741,8 @@ fn op_css_supports(#[string] name: &str, #[string] value: &str) -> bool {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_metrics(state: &OpState) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_metrics(state: &OpState, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let viewport = gs.viewport;
@@ -7745,8 +7758,8 @@ fn op_layout_metrics(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -7782,8 +7795,8 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f64, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -7826,8 +7839,8 @@ fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_scroll_offset(state: &OpState) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_scroll_offset(state: &OpState, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let requested = gs.scroll_offset;
@@ -7838,8 +7851,8 @@ fn op_scroll_offset(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_scroll_to(state: &OpState, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_scroll_to(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let (x, y) = clamp_scroll_offset_for_geometry(&mut gs, (x as f32, y as f32));

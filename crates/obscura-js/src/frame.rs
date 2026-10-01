@@ -204,6 +204,12 @@ impl FrameRealm {
         } else {
             150.0
         };
+        #[cfg(feature = "render")]
+        {
+            let state = self.realms.borrow().by_frame_id(self.frame_id)
+                .ok_or_else(|| "could not resize frame: missing realm".to_string())?;
+            state.borrow_mut().set_viewport(width, height);
+        }
         self.execute_script(
             parent,
             &format!(
@@ -586,6 +592,32 @@ mod tests {
                 .unwrap(),
             serde_json::json!([300, 65, 300, 65]),
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_renderer_viewport_changes_do_not_resize_the_page() {
+        let mut parent = page("https://parent.example/",
+            "<html><head><style>body{margin:0}#page{width:100vw;height:100vh}</style></head><body><div id='page'></div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><head><style>body{margin:0}div{width:50vw;height:25vh}</style></head><body><div id='box'></div></body></html>").unwrap();
+        frame.set_viewport(&mut parent, 300.0, 80.0).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            const r = document.getElementById('box').getBoundingClientRect();
+            globalThis.savedStyle = getComputedStyle(document.getElementById('box'));
+            return [r.width, r.height, savedStyle.width, savedStyle.height];
+        })()"#).unwrap(), serde_json::json!([150, 20, "150px", "20px"]));
+        frame.set_viewport(&mut parent, 200.0, 120.0).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            const r = document.getElementById('box').getBoundingClientRect();
+            const fresh = getComputedStyle(document.getElementById('box'));
+            return [r.width, r.height, savedStyle.width, savedStyle.height,
+                fresh.width, fresh.height];
+        })()"#).unwrap(), serde_json::json!([100, 30, "100px", "30px", "100px", "30px"]));
+        assert_eq!(parent.evaluate(r#"(() => {
+            const r = document.getElementById('page').getBoundingClientRect();
+            return [r.width, r.height];
+        })()"#).unwrap(), serde_json::json!([1280, 720]));
     }
 
     /// A frame must not look like a different browser than its parent. Anti-bot
