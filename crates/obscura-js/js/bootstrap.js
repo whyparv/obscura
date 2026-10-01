@@ -7759,6 +7759,13 @@ globalThis.fetch = async (input, init = {}) => {
     url: exposeRedirectMetadata ? (parsed.url || url) : (respType === "opaque" ? "" : url),
     redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
+  if (typeof parsed.bodyRid === 'number') {
+    // ponytail: preserve bounded one-chunk bodies; incremental delivery needs
+    // stream backpressure rather than eagerly queuing every network chunk.
+    const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid);
+    promise.catch(() => {}); // An unread/cancelled body must not report an unhandled rejection.
+    response._fetchBody = { promise, resource: { rid: parsed.bodyRid, consumers: 1 } };
+  }
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
       value: parsed.requestId,
@@ -8210,6 +8217,7 @@ if (typeof Response === 'undefined') {
       this._bodyNull = body === null || body === undefined;
       this._bodyStream = null;
       this._bodyUsed = false;
+      this._fetchBody = null;
     }
     _consumeBody() {
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
@@ -8221,8 +8229,18 @@ if (typeof Response === 'undefined') {
       if (!this._bodyStream) {
         this._bodyStream = new ReadableStream({
           start: (controller) => {
-            if (this._bodyBytes.length) controller.enqueue(this._bodyBytes);
-            controller.close();
+            const deliver = (bytes) => {
+              if (bytes.length) controller.enqueue(bytes);
+              controller.close();
+            };
+            if (this._fetchBody) this._fetchBody.promise.then(deliver, error => controller.error(error));
+            else deliver(this._bodyBytes);
+          },
+          cancel: () => {
+            this._bodyUsed = true;
+            if (this._fetchBody && --this._fetchBody.resource.consumers === 0) {
+              __obscuraCore.ops.op_try_close(this._fetchBody.resource.rid);
+            }
           },
         });
         // bodyUsed flips the moment the stream is locked for reading
@@ -8243,11 +8261,20 @@ if (typeof Response === 'undefined') {
       return this._bodyStream;
     }
     get bodyUsed() { return this._bodyUsed; }
-    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
-    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
-    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers); }
+    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
+    clone() {
+      const copy = new Response(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
+      if (this._fetchBody) {
+        const promise = this._fetchBody.promise.then(bytes => bytes.slice());
+        promise.catch(() => {});
+        this._fetchBody.resource.consumers++;
+        copy._fetchBody = { promise, resource: this._fetchBody.resource };
+      }
+      return copy;
+    }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
     static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
@@ -14849,7 +14876,9 @@ if (typeof ReadableStream === 'undefined') {
       };
     }
     cancel(reason) {
+      if (this._state === "errored") return Promise.reject(this._error);
       this._queue.length = 0;
+      if (this._state === "closed") return Promise.resolve();
       this._controller.close();
       try { return Promise.resolve(this._source.cancel?.(reason)); }
       catch (error) { return Promise.reject(error); }

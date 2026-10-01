@@ -18649,6 +18649,139 @@ mod tests {
         );
     }
 
+    async fn held_fetch_body_runtime() -> (
+        ObscuraJsRuntime, tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/resource", listener.local_addr().unwrap());
+        let (release, body_release) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\
+                Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n").await.unwrap();
+            body_release.await.unwrap();
+            stream.write_all(b"tail").await
+        });
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let cookie_jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                cookie_jar.clone(), None, true,
+            ),
+        ));
+        #[cfg(feature = "stealth")]
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::with_proxy(cookie_jar, None, true),
+        ));
+        rt.execute_script("header-first-fetch", &format!(
+            "globalThis.headerResponse = null; fetch({target:?}).then(r => headerResponse = r);"
+        )).unwrap();
+        (rt, release, server)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_resolves_headers_before_the_response_body_finishes() {
+        let (mut rt, release, server) = held_fetch_body_runtime().await;
+        let headers_first = rt.resolve_promises_until(
+            |rt| rt.evaluate("headerResponse !== null").unwrap() == serde_json::json!(true),
+            2_000,
+        ).await;
+        let pending_body = rt.has_pending_network_requests();
+        // Release and verify the bytes even on RED, so the fixture never hangs.
+        release.send(()).unwrap();
+        let result = rt.call_function_on_for_cdp(
+            "async () => { const r = headerResponse || await new Promise(resolve => { \
+                const check = () => headerResponse ? resolve(headerResponse) : setTimeout(check, 1); \
+                check(); }); const unread = !r.bodyUsed; \
+                return { status: r.status, unread, text: await r.text(), used: r.bodyUsed }; }",
+            None, &[], true, true,
+        ).await.unwrap();
+        server.await.unwrap().unwrap();
+        assert_eq!(result.value, Some(serde_json::json!({
+            "status": 200, "unread": true, "text": "tail", "used": true,
+        })));
+        assert!(headers_first, "fetch must expose headers while the body is still held");
+        assert!(pending_body, "headers must not mark the unfinished body as network-idle");
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_fetch_clone_cancellation_preserves_the_other_body() {
+        let (mut rt, release, server) = held_fetch_body_runtime().await;
+        let headers_first = rt.resolve_promises_until(
+            |rt| rt.evaluate("headerResponse !== null").unwrap() == serde_json::json!(true),
+            2_000,
+        ).await;
+        if headers_first {
+            assert_eq!(rt.evaluate("(() => { \
+                const copy = headerResponse.clone(); const stream = copy.body; \
+                stream.cancel(); stream.cancel(); \
+                return [headerResponse.bodyUsed, copy.bodyUsed]; })()").unwrap(),
+                serde_json::json!([false, true]));
+        }
+        release.send(()).unwrap();
+        let result = rt.call_function_on_for_cdp(
+            "async () => await headerResponse.text()", None, &[], true, true,
+        ).await.unwrap();
+        let _ = server.await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("tail")));
+        assert!(headers_first);
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_clone_body_bytes_are_independent() {
+        let (mut rt, release, server) = held_fetch_body_runtime().await;
+        let headers_first = rt.resolve_promises_until(
+            |rt| rt.evaluate("headerResponse !== null").unwrap() == serde_json::json!(true),
+            2_000,
+        ).await;
+        if headers_first {
+            rt.execute_script("clone-held-body", "globalThis.clonedResponse = headerResponse.clone();").unwrap();
+        }
+        release.send(()).unwrap();
+        let result = rt.call_function_on_for_cdp(
+            "async () => { const reader = headerResponse.body.getReader(); \
+                const { value } = await reader.read(); value[0] = 88; \
+                return [new TextDecoder().decode(value), await clonedResponse.text()]; }",
+            None, &[], true, true,
+        ).await.unwrap();
+        server.await.unwrap().unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(["Xail", "tail"])));
+        assert!(headers_first);
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_all_fetch_clones_releases_the_pending_body() {
+        let (mut rt, release, server) = held_fetch_body_runtime().await;
+        let headers_first = rt.resolve_promises_until(
+            |rt| rt.evaluate("headerResponse !== null").unwrap() == serde_json::json!(true),
+            2_000,
+        ).await;
+        if headers_first {
+            let result = rt.call_function_on_for_cdp(
+                "async () => { const copy = headerResponse.clone(); \
+                    await copy.body.cancel(); await headerResponse.body.cancel(); \
+                    return [headerResponse.bodyUsed, copy.bodyUsed]; }",
+                None, &[], true, true,
+            ).await.unwrap();
+            assert_eq!(result.value, Some(serde_json::json!([true, true])));
+        }
+        let cancelled = rt.resolve_promises_until(
+            |rt| !rt.has_pending_network_requests(), 2_000,
+        ).await;
+        release.send(()).unwrap();
+        let _ = server.await.unwrap();
+        assert!(headers_first);
+        assert!(cancelled, "cancelling every clone must release the held network body");
+    }
+
     fn cors_preflight_runtime() -> (ObscuraJsRuntime, String, std::sync::mpsc::Receiver<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
