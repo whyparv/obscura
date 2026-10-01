@@ -8298,13 +8298,22 @@ mod tests {
         )
         .unwrap();
 
-        for _ in 0..7 {
+        // A V8 maintenance wake may finish a turn without delivering a timer.
+        // Count actual ticks, while retaining a bound and the per-turn yield.
+        let mut ticks = 0.0;
+        for _ in 0..14 {
             rt.run_autonomous_event_loop_turn().await.unwrap();
+            let next = rt.evaluate("globalThis.__nestedTimerDelays.length")
+                .unwrap().as_f64().unwrap();
+            assert!(next <= ticks + 1.0,
+                "a repeating timer must yield between ticks: {ticks} -> {next}");
+            ticks = next;
+            if ticks == 7.0 {
+                break;
+            }
         }
         assert_eq!(
-            rt.evaluate("globalThis.__nestedTimerDelays.length")
-                .unwrap(),
-            serde_json::json!(7.0),
+            ticks, 7.0,
             "the interval must continue yielding and making progress",
         );
         let observed = rt.evaluate("globalThis.__nestedTimerDelays").unwrap();
