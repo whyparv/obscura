@@ -3896,29 +3896,30 @@ impl ObscuraJsRuntime {
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
-            // Pump for a short slice. If the loop returns idle in <tick_ms,
-            // run_event_loop returns Ok and we check the predicate again.
+            // Return between browser turns even when a framework keeps its
+            // posted-task queue ready. A run-to-idle wait can spend the whole
+            // slice in JS, then repeatedly observe expired sleeps without
+            // yielding to the network reactor.
             let slice_deadline = (tokio::time::Instant::now()
                 + tokio::time::Duration::from_millis(tick_ms)).min(deadline);
-            let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
-                runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
-            });
-            let _ = tokio::time::timeout_at(slice_deadline, event_loop).await;
+            let turn = tokio::time::timeout_at(
+                slice_deadline, self.run_cooperative_event_loop_tick(),
+            ).await;
             if self.recover_heap_limit() {
                 return false;
             }
             if done_check(self) {
                 return true;
             }
-            // An idle event loop can return immediately while an unresolvable
-            // promise remains pending. Yield here so connection shutdown can
-            // cancel the evaluation, and actually back off instead of spinning.
-            // Reuse the slice deadline so a busy poll does not pay twice.
-            tokio::time::sleep_until(slice_deadline).await;
-            // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
-            // worst case we miss the result by <50ms.
-            if tick_ms < 50 {
+            if matches!(turn, Ok(Ok(true)) | Ok(Err(_))) {
+                // An idle loop or repeated page error must not spin while
+                // an unresolvable promise remains pending.
+                tokio::time::sleep_until(slice_deadline).await;
                 tick_ms = (tick_ms * 2).min(50);
+            } else {
+                // A busy turn may already exceed the slice. An expired sleep
+                // is not a yield; let I/O and other tasks make progress now.
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -17042,6 +17043,38 @@ mod tests {
         heartbeat.abort();
         assert!(turns.load(Ordering::Relaxed) > 1,
             "an idle promise wait must yield instead of spinning until its deadline");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaited_fetch_progresses_while_posted_tasks_remain_ready() {
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        let result = rt.evaluate_for_cdp(
+            r#"(async () => {
+                const channel = new MessageChannel();
+                const deadline = Date.now() + 2000;
+                let turns = 0;
+                channel.port1.onmessage = () => {
+                    turns++;
+                    const taskEnd = Date.now() + 60;
+                    while (Date.now() < taskEnd) {}
+                    if (Date.now() < deadline) channel.port2.postMessage(null);
+                };
+                channel.port2.postMessage(null);
+                const text = await (await fetch('/hydrate')).text();
+                channel.port1.close();
+                channel.port2.close();
+                return { text, turns };
+            })()"#,
+            true, true,
+        ).await.unwrap();
+        let elapsed = started.elapsed();
+        accepted.recv_timeout(std::time::Duration::from_millis(100)).unwrap();
+        let value = result.value.unwrap();
+        assert_eq!(value["text"], "hydrated");
+        assert!(value["turns"].as_f64().unwrap() > 0.0);
+        assert!(elapsed < std::time::Duration::from_millis(1000),
+            "network progress waited for the posted-task queue to drain: {elapsed:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
