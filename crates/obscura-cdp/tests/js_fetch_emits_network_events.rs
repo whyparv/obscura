@@ -290,7 +290,7 @@ async fn stealth_response_body_buffer_evicts_old_requests() {
 #[tokio::test(flavor = "current_thread")]
 async fn stealth_http_error_response_keeps_status_and_body() {
     let (mut ctx, session, _base) = stealth_context().await;
-    let response = cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":"fetch('/api/missing.json').then(r=>r.status)","awaitPromise":true,"returnByValue":true}), &session).await;
+    let response = cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":"fetch('/api/missing.json').then(async r=>{await r.text();return r.status})","awaitPromise":true,"returnByValue":true}), &session).await;
     assert_eq!(response["result"]["value"].as_f64(), Some(404.0));
     let page = ctx.get_session_page_mut(&Some(session.clone())).unwrap();
     page.sync_js_network_events();
