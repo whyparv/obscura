@@ -1572,4 +1572,36 @@ mod tests {
         assert!(!frame.is_same_origin_as("null"));
         assert!(!frame.is_same_origin_as("https://parent.example"));
     }
+
+    #[test]
+    fn file_list_global_exists_and_input_files_is_instance() {
+        // Issue #1232: `typeof FileList` was `undefined`, crashing apps that
+        // reference it while booting.
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f></body></html>",
+        );
+        assert_eq!(
+            rt.evaluate("typeof FileList").unwrap(),
+            serde_json::json!("function")
+        );
+        assert_eq!(
+            rt.evaluate("Object.prototype.toString.call(document.getElementById('f').files)")
+                .unwrap(),
+            serde_json::json!("[object FileList]")
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').files instanceof FileList")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').files.length").unwrap(),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            rt.evaluate("(() => { try { new FileList(); return 'no-throw'; } catch (e) { return e.name + ': ' + e.message; } })()").unwrap(),
+            serde_json::json!("TypeError: Illegal constructor")
+        );
+    }
 }
