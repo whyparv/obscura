@@ -11247,6 +11247,7 @@ if (typeof File === "undefined") globalThis.File = class File extends Blob {
 if (typeof FileList === "undefined") globalThis.FileList = class FileList {
   constructor() { throw new TypeError("Illegal constructor"); }
   item(i) { const v = this[i]; return v === undefined ? null : v; }
+  [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
   get [Symbol.toStringTag]() { return "FileList"; }
 };
 // A FormData value keeps Blob/File objects as-is (the multipart serializer reads

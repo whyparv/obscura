@@ -1604,4 +1604,38 @@ mod tests {
             serde_json::json!("TypeError: Illegal constructor")
         );
     }
+
+    #[test]
+    fn file_list_iteration_preserves_uploaded_files() {
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f multiple></body></html>",
+        );
+        let result = rt.evaluate(r#"(() => {
+            const input = document.getElementById('f');
+            const empty = [...input.files].length;
+            __obscura_setInputFiles(input, [
+                {name: 'first.txt', type: 'text/plain', b64: 'YQ=='},
+                {name: 'second.txt', type: 'text/plain', b64: 'Yg=='}
+            ]);
+            const files = input.files;
+            const names = [];
+            for (const file of files) names.push(file.name);
+            const iterator = files[Symbol.iterator]();
+            return {
+                empty,
+                spread: [...files].map(file => file.name),
+                names,
+                sameFile: [...files][0] === files.item(0),
+                iterableIterator: iterator[Symbol.iterator]() === iterator
+            };
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "empty": 0,
+            "spread": ["first.txt", "second.txt"],
+            "names": ["first.txt", "second.txt"],
+            "sameFile": true,
+            "iterableIterator": true
+        }));
+    }
 }
