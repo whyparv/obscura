@@ -22318,6 +22318,58 @@ mod tests {
         (rt, target, requests_rx)
     }
 
+
+    #[test]
+    fn request_headers_ignore_forbidden_names_and_remain_guarded() {
+        let mut rt = setup_runtime("<body></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const headers = new Headers({Host: 'standalone'});
+            const request = new Request('/resource', {headers: {
+                HoSt: 'initial', 'Content-Length': '42', Cookie: 'secret=1',
+                'Sec-Example': 'spoofed', 'Proxy-Example': 'spoofed',
+                'X-HTTP-Method': 'TRACE', 'X-HTTP-Method-Override': 'DELETE',
+                'X-Test': 'kept'
+            }});
+            request.headers.set('HOST', 'replacement');
+            request.headers.append('Sec-Example', 'replacement');
+            request.headers.set('X-HTTP-Method-Override', 'TRACE');
+            const clone = request.clone();
+            clone.headers.set('Cookie', 'replacement');
+            return [headers.get('host'), request.headers.get('host'),
+                request.headers.get('content-length'), request.headers.get('cookie'),
+                request.headers.get('sec-example'), request.headers.get('proxy-example'),
+                request.headers.get('x-http-method'), request.headers.get('x-http-method-override'),
+                request.headers.get('x-test'), clone.headers.get('cookie')];
+        })()"#).unwrap(), serde_json::json!([
+            "standalone", null, null, null, null, null, null, "DELETE", "kept", null
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn script_forbidden_headers_do_not_reach_cors_preflight_or_transport() {
+        for api in ["fetch", "request", "xhr"] {
+            let (mut rt, target, requests) = cors_preflight_runtime();
+            let result = rt.call_function_on_for_cdp(&format!(r#"async () => {{
+                const headers = {{'Content-Type': 'application/json', Host: 'attacker.invalid'}};
+                if ({api:?} === 'xhr') return await new Promise((resolve, reject) => {{
+                    const xhr = new XMLHttpRequest(); xhr.open('GET', {target:?});
+                    for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+                    xhr.onload = () => resolve(xhr.responseText); xhr.onerror = reject; xhr.send();
+                }});
+                const response = {api:?} === 'request'
+                    ? await fetch(new Request({target:?}, {{headers}}))
+                    : await fetch({target:?}, {{headers}});
+                return response.text();
+            }}"#), None, &[], true, true).await.unwrap();
+            assert_eq!(result.value, Some(serde_json::json!("ok")), "{api}");
+            let preflight = requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap().to_ascii_lowercase();
+            assert!(preflight.contains("access-control-request-headers: content-type\r\n"), "{api}: {preflight}");
+            let request = requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            assert!(request.starts_with("GET /resource "), "{api}: {request}");
+            assert!(!request.contains("attacker.invalid"), "{api}: forbidden Host reached the wire");
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn denied_preflight_never_sends_the_unsafe_request() {
         let (mut rt, target, requests) = cors_preflight_runtime();

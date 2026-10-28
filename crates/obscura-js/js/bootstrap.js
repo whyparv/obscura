@@ -8520,6 +8520,30 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
+const _requestHeaderGuards = new WeakSet();
+const _forbiddenRequestHeaderNames = new Set([
+  'accept-charset', 'accept-encoding', 'access-control-request-headers',
+  'access-control-request-method', 'connection', 'content-length', 'cookie',
+  'cookie2', 'date', 'dnt', 'expect', 'host', 'keep-alive', 'origin', 'referer',
+  'set-cookie', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'via',
+]);
+function _isForbiddenRequestHeader(name, value) {
+  name = String(name).toLowerCase();
+  if (_forbiddenRequestHeaderNames.has(name) || name.startsWith('sec-') || name.startsWith('proxy-')) return true;
+  return (name === 'x-http-method' || name === 'x-http-method-override' || name === 'x-method-override')
+    && String(value).split(',').some(method => ['CONNECT', 'TRACE', 'TRACK'].includes(method.trim().toUpperCase()));
+}
+function _filterRequestHeaders(headers) {
+  const filtered = Object.create(null);
+  if (headers == null) return filtered;
+  const entries = typeof headers[Symbol.iterator] === 'function' ? headers : Object.entries(headers);
+  for (const [name, value] of entries) {
+    const key = String(name), text = String(value);
+    if (!_isForbiddenRequestHeader(key, text)) filtered[key] = text;
+  }
+  return filtered;
+}
+
 const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
@@ -8538,7 +8562,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   // checks (#969).
   const method = String(init.method || (request ? request.method : "GET")).toUpperCase();
   const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
-  let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
+  const _h = _filterRequestHeaders(headers);
   const inheritsRequestBody = init.body === undefined && request !== null;
   const initBody = init.body !== undefined
     ? init.body
@@ -8628,9 +8652,10 @@ globalThis.fetch = (input, init = {}) => _fetch(input, init);
 if (typeof Headers === "undefined") {
   globalThis.Headers = class Headers {
     constructor(init={}) { this._h={}; if(init) { if(init instanceof Headers) { init.forEach((v,k)=>{this._h[k]=v;}); } else if(typeof init==="object") { for(const[k,v]of Object.entries(init)) this._h[k.toLowerCase()]=String(v); } } }
-    get(n) { return this._h[n.toLowerCase()]??null; } set(n,v) { this._h[n.toLowerCase()]=String(v); }
+    get(n) { return this._h[n.toLowerCase()]??null; }
+    set(n,v) { n=String(n).toLowerCase(); v=String(v); if(!_requestHeaderGuards.has(this)||!_isForbiddenRequestHeader(n,v)) this._h[n]=v; }
     has(n) { return n.toLowerCase() in this._h; } delete(n) { delete this._h[n.toLowerCase()]; }
-    append(n,v) { this._h[n.toLowerCase()]=String(v); }
+    append(n,v) { n=String(n).toLowerCase(); v=String(v); if(!_requestHeaderGuards.has(this)||!_isForbiddenRequestHeader(n,v)) this._h[n]=v; }
     forEach(cb) { for(const[k,v] of Object.entries(this._h)) cb(v,k,this); }
     entries() { return Object.entries(this._h)[Symbol.iterator](); }
     keys() { return Object.keys(this._h)[Symbol.iterator](); }
@@ -8725,7 +8750,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   }
 
   setRequestHeader(name, value) {
-    this._headers[name] = value;
+    name = String(name); value = String(value);
+    if (!_isForbiddenRequestHeader(name, value)) this._headers[name] = value;
   }
 
   getResponseHeader(name) {
@@ -9000,7 +9026,8 @@ if (typeof Request === 'undefined') {
       else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
       else { this.url = input?.url || input?.href || String(input); }
       this.method = (init.method || 'GET').toUpperCase();
-      this.headers = new Headers(init.headers);
+      this.headers = new Headers(_filterRequestHeaders(init.headers));
+      _requestHeaderGuards.add(this.headers);
       this.body = init.body || null;
       this.mode = init.mode || 'cors';
       this.credentials = init.credentials !== undefined
