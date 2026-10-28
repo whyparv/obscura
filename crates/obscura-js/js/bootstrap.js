@@ -5167,8 +5167,8 @@ class Element extends Node {
   _resetIframeFrame() {
     _resetIframeElement(this);
   }
-  _loadIframeSrc(url) {
-    if (this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
+  _loadIframeSrc(url, submission) {
+    if (!submission && this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
     if (url === 'about:blank' || !url) { this._resetIframeFrame(); return; }
     let fullUrl = url;
     if (!url.includes('://')) {
@@ -5176,36 +5176,41 @@ class Element extends Node {
     }
     // Both the src setter and the parser sweep in __obscura_init reach here, so
     // a frame the page assigned before init must not be fetched a second time.
-    if (this._iframeLoadingUrl === fullUrl) return;
+    if (!submission && this._iframeLoadingUrl === fullUrl) return;
     this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
+    // Distinguish repeated form POSTs to the same URL from an older response.
+    const request = this._iframeRequest = {};
     const el = this;
-    let pageOrigin = '';
-    try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
+    const pageOrigin = _realmOrigin();
+    const method = submission?.method || 'GET';
+    const headers = method === 'POST' ? '{"Content-Type":"application/x-www-form-urlencoded"}' : '{}';
+    const body = submission?.body ? new TextEncoder().encode(submission.body) : new Uint8Array(0);
     __obscuraCore.ops.op_fetch_url(
-      fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
-      'no-cors', 'same-origin', 'Document'
+      fullUrl, method, headers, body, pageOrigin,
+      'no-cors', submission ? 'include' : 'same-origin', 'Document'
     ).then(raw => {
-      if (el._iframeLoadingUrl !== fullUrl) return;
+      if (el._iframeRequest !== request) return;
       const response = JSON.parse(raw);
       if (!response.blocked && response.status > 0 && response.status < 400) {
         const html = response.body || '';
         const loadedUrl = response.url || fullUrl;
         el._iframeLoadedUrl = loadedUrl;
         el._iframeOpaque = _sandboxOpaqueOrigin;
+        try { el._iframeOpaque ||= new URL(loadedUrl).origin !== pageOrigin; } catch (_) { el._iframeOpaque = true; }
         // The host fires load after creating the realm and running its scripts.
         const box = el.getBoundingClientRect();
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
           loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
-        el._iframeDoc = new _IframeDocument(html, loadedUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
+        el._iframeDoc = el._iframeOpaque ? null : new _IframeDocument(html, loadedUrl, el);
+        el._iframeWin = el._iframeOpaque ? _remoteWindow(el._frameId) : new _IframeWindow(el._iframeDoc, loadedUrl);
         // Bind the window to the realm the host just queued. This is what makes
         // posting into the frame reach the frame's own listeners, and makes a
         // message coming back out arrive with this window as its `source`.
         if (el._frameId) {
-          el._iframeWin._frameId = el._frameId;
+          if (!el._iframeOpaque) el._iframeWin._frameId = el._frameId;
           globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
           globalThis.__obscura_frameElements[el._frameId] = el;
           return;
@@ -5221,7 +5226,7 @@ class Element extends Node {
       // directly bypasses listeners registered via addEventListener.
       el.dispatchEvent(new Event('load'));
     }).catch(() => {
-      if (el._iframeLoadingUrl !== fullUrl) return;
+      if (el._iframeRequest !== request) return;
       el._iframeLoadedUrl = fullUrl;
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
@@ -5260,7 +5265,7 @@ class Element extends Node {
     if (real?.document) return real.document;
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
-      if (this.src === '' || this.src === 'about:blank' || this._iframeLoadedUrl === 'about:blank') {
+      if (this._iframeLoadedUrl === 'about:blank') {
         return this._iframeDoc;
       }
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this._iframeLoadedUrl);
@@ -5446,11 +5451,25 @@ class Element extends Node {
     try { targetUrl = new URL(action, baseUrl).href; } catch(e) { targetUrl = action; }
 
     const encoded = pairs.join('&');
+    if (method !== 'POST') {
+      const sep = targetUrl.includes('?') ? '&' : '?';
+      targetUrl += encoded ? sep + encoded : '';
+    }
+    const owner = this.ownerDocument || document;
+    const target = submitter?.getAttribute('formtarget') ?? this.getAttribute('target') ??
+      owner.querySelector('base[target]')?.getAttribute('target') ?? '';
+    if (target && !['_self', '_parent', '_top', '_blank'].includes(target.toLowerCase())) {
+      for (const frame of owner.getElementsByTagName('iframe')) {
+        if (frame.getAttribute('name') === target && frame.namespaceURI === 'http://www.w3.org/1999/xhtml') {
+          frame._loadIframeSrc(targetUrl, { method: method === 'POST' ? 'POST' : 'GET', body: method === 'POST' ? encoded : '' });
+          return;
+        }
+      }
+    }
     if (method === 'POST') {
       __obscuraCore.ops.op_navigate(targetUrl, 'POST', encoded);
     } else {
-      const sep = targetUrl.includes('?') ? '&' : '?';
-      __obscuraCore.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
+      __obscuraCore.ops.op_navigate(targetUrl, 'GET', '');
     }
   }
   reset() {
@@ -15369,6 +15388,7 @@ globalThis.__obscura_liveFrameIds = function () {
 // surviving reference keeps the frame's context and DOM tree alive.
 globalThis.__obscura_forgetFrame = function (frameId) {
   _dom('retire_frame', frameId);
+  _remoteWindows.delete(frameId);
   delete globalThis.__obscura_frameElements[frameId];
   delete globalThis.__obscura_frameObjects[frameId];
   delete globalThis.__obscura_frameWindows[frameId];
@@ -15495,6 +15515,7 @@ function _resetIframeElement(element) {
   element._frameId = 0;
   element._iframeOpaque = false;
   element._iframeLoadingUrl = null;
+  element._iframeRequest = null;
   element._iframeLoadedUrl = 'about:blank';
   element._iframeDoc = new _IframeDocument(
     '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', element);

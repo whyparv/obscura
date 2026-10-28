@@ -7166,6 +7166,96 @@ mod tests {
         }
     }
 
+    async fn spawn_form_target_server() -> (
+        String, tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let sent = sent.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0; 2048];
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        if count == 0 { return; }
+                        request.extend_from_slice(&buffer[..count]);
+                        let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") else { continue };
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                        }).unwrap_or(0);
+                        if request.len() < end + 4 + length { continue; }
+                        sent.send((headers.lines().next().unwrap().to_string(),
+                            String::from_utf8_lossy(&request[end + 4..]).to_string())).unwrap();
+                        break;
+                    }
+                    let body = "<title>Child response</title><p>submitted</p><script>globalThis.formRan=true</script>";
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (base, requests)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_submission_to_named_iframe_keeps_the_top_document() {
+        let (base, mut requests) = spawn_form_target_server().await;
+        for method in ["GET", "POST"] {
+            for dynamic in [false, true] {
+                let frame = if dynamic { "" } else { "<iframe name='sink'></iframe>" };
+                let html = format!("<title>Top document</title>{frame}<form action='/submit' method='{method}' target='sink'><input name='value' value='hello world'></form>");
+                let mut page = import_map_test_page("named-form", &base, &html);
+                page.evaluate_script(&format!(r#"(() => {{
+                    if ({dynamic}) {{ const frame = document.createElement('iframe'); frame.name = 'sink'; document.body.appendChild(frame); }}
+                    document.forms[0].submit(); return true;
+                }})()"#)).unwrap();
+                assert!(!page.has_pending_navigation(), "{method}, dynamic={dynamic}: submission targeted the top document");
+                pump_srcdoc_frames(&mut page).await;
+                let expected = if method == "POST" {
+                    ("POST /submit HTTP/1.1", "value=hello+world")
+                } else {
+                    ("GET /submit?value=hello+world HTTP/1.1", "")
+                };
+                let request = requests.try_recv().expect("form request reached the server");
+                assert_eq!(request, (expected.0.to_string(), expected.1.to_string()));
+                assert_eq!(page.evaluate_script("[document.title, document.querySelector('iframe').contentDocument.title, document.querySelector('iframe').contentWindow.formRan]").unwrap(),
+                    serde_json::json!(["Top document", "Child response", true]));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn named_iframe_form_navigation_preserves_targets_and_origin_checks() {
+        let (base, mut requests) = spawn_form_target_server().await;
+        let (other, mut cross_requests) = spawn_form_target_server().await;
+        let mut page = import_map_test_page("named-form-overrides", &base,
+            "<base target='sink'><title>Top document</title><iframe name='sink' srcdoc='initial'></iframe><form action='/submit' method='POST' target='_self'><input name='x' value='1'><button id='send' formtarget='sink'>Send</button></form>");
+        for _ in 0..2 {
+            page.evaluate_script("document.forms[0].requestSubmit(document.getElementById('send'))").unwrap();
+            assert!(!page.has_pending_navigation());
+            pump_srcdoc_frames(&mut page).await;
+            assert_eq!(requests.try_recv().unwrap(), ("POST /submit HTTP/1.1".into(), "x=1".into()));
+            assert_eq!(page.evaluate_script("document.querySelector('iframe').contentDocument.title").unwrap(),
+                serde_json::json!("Child response"));
+        }
+        page.evaluate_script(&format!("document.forms[0].removeAttribute('target'); document.forms[0].action = '{other}/cross'; document.forms[0].submit()" )).unwrap();
+        assert!(!page.has_pending_navigation());
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(cross_requests.try_recv().unwrap(), ("POST /cross HTTP/1.1".into(), "x=1".into()));
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const frame = document.querySelector('iframe');
+            let readable = false;
+            try { readable = !!frame.contentWindow.document?.body; } catch (_) {}
+            return [document.title, frame.contentDocument === null, readable];
+        })()"#).unwrap(), serde_json::json!(["Top document", true, false]));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn iframe_srcdoc_loads_parser_and_inserted_documents_in_their_own_realms() {
         let mut page = import_map_test_page("srcdoc", "https://parent.test",
