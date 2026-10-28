@@ -76,6 +76,7 @@ pub struct CdpContext {
     browser_context_counter: u32,
     target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
+    pub(crate) preload_script_pages: HashMap<String, String>,
     pub preload_counter: u32,
     // Which sessions asked for each `Runtime.addBinding` name. A binding is a
     // session-scoped subscription in CDP, and a client discards any event whose
@@ -192,6 +193,7 @@ impl CdpContext {
             browser_context_counter: 0,
             target_session_counter: 0,
             preload_scripts: Vec::new(),
+            preload_script_pages: HashMap::new(),
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
             lifecycle_enabled_sessions: HashSet::new(),
@@ -334,7 +336,17 @@ impl CdpContext {
         }
     }
 
+    // Runtime binding shims have no target owner; Page scripts do.
+    pub(crate) fn preload_sources_for_page(&self, page_id: &str) -> Vec<String> {
+        self.preload_scripts.iter()
+            .filter(|(id, _)| self.preload_script_pages.get(id).is_none_or(|owner| owner == page_id))
+            .map(|(_, source)| source.clone()).collect()
+    }
+
     pub fn remove_page(&mut self, id: &str) {
+        self.preload_scripts.retain(|(script_id, _)|
+            self.preload_script_pages.get(script_id).is_none_or(|owner| owner != id));
+        self.preload_script_pages.retain(|_, owner| owner != id);
         self.dom_documents.retain(|_, document| document.page_id != id);
         self.pending_beforeunload_close.remove(id);
         let removed_sessions: Vec<String> = self
