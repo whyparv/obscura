@@ -1357,7 +1357,8 @@ async fn do_navigate(
         );
     }
 
-    let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+    let preload_page = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+    let preload_scripts = ctx.preload_sources_for_page(&preload_page);
 
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
         let page = ctx
@@ -1607,6 +1608,7 @@ pub async fn handle(
             {
                 return Err("Immediate scripts in isolated worlds are not supported".to_string());
             }
+            let page_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
             ctx.preload_counter += 1;
             let identifier = format!("{}", ctx.preload_counter);
             if !source.is_empty() {
@@ -1629,6 +1631,9 @@ pub async fn handle(
             // Store empty sources too: Chrome returns a removable id for them.
             ctx.preload_scripts
                 .push((identifier.clone(), source.to_string()));
+            ctx.preload_script_pages.insert(identifier.clone(), page_id.clone());
+            let sources = ctx.preload_sources_for_page(&page_id);
+            if let Some(page) = ctx.get_page_mut(&page_id) { page.set_preload_scripts(sources); }
             Ok(json!({ "identifier": identifier }))
         }
         "removeScriptToEvaluateOnNewDocument" => {
@@ -1636,12 +1641,19 @@ pub async fn handle(
                 .get("identifier")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let page_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+            if ctx.preload_script_pages.get(identifier) != Some(&page_id) {
+                return Err("Script not found".to_string());
+            }
             // Chrome reports an unknown or already removed id as an error.
             let before = ctx.preload_scripts.len();
             ctx.preload_scripts.retain(|(id, _)| id != identifier);
             if ctx.preload_scripts.len() == before {
                 return Err("Script not found".to_string());
             }
+            ctx.preload_script_pages.remove(identifier);
+            let sources = ctx.preload_sources_for_page(&page_id);
+            if let Some(page) = ctx.get_page_mut(&page_id) { page.set_preload_scripts(sources); }
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
@@ -1764,8 +1776,8 @@ pub async fn handle(
                 (url, snapshot.0, snapshot.1)
             };
             if let Some(url) = target_url {
-                let preload_scripts: Vec<String> =
-                    ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+                let preload_page = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+                let preload_scripts = ctx.preload_sources_for_page(&preload_page);
                 let nav_result = {
                     let page = ctx
                         .get_session_page_mut(session_id)
@@ -2144,6 +2156,50 @@ mod tests {
         assert!(ctx.pending_events.iter().all(|event| event.method != "Network.requestWillBeSent"));
         assert_eq!(ctx.pending_events.iter().filter(|event| event.session_id.as_deref() == Some("observer-a")).count(), 2);
         assert!(!ctx.pending_events.iter().any(|event| event.session_id.as_deref() == Some("observer-b")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preload_scripts_stay_with_their_target_and_are_released_on_close() {
+        let mut ctx = CdpContext::new();
+        let first = ctx.create_page(); let second = ctx.create_page();
+        let a = Some(format!("{first}-session")); let b = Some(format!("{second}-session"));
+        ctx.sessions.insert(a.clone().unwrap(), first.clone());
+        ctx.sessions.insert(b.clone().unwrap(), second.clone());
+        let registration = handle("addScriptToEvaluateOnNewDocument", &json!({
+            "source":"globalThis.owner='first'; globalThis.count=(globalThis.count||0)+1",
+        }), &mut ctx, &a).await.unwrap();
+        handle("addScriptToEvaluateOnNewDocument", &json!({
+            "source":"globalThis.owner='second'; globalThis.count=(globalThis.count||0)+1",
+        }), &mut ctx, &b).await.unwrap();
+        for (session, owner) in [(&a, "first"), (&b, "second")] {
+            handle("navigate", &json!({"url":"about:blank"}), &mut ctx, session).await.unwrap();
+            assert_eq!(ctx.get_session_page_mut(session).unwrap().evaluate_script("[owner, count]").unwrap(),
+                json!([owner, 1]));
+        }
+        handle("addScriptToEvaluateOnNewDocument", &json!({"source":"globalThis.latest=true"}),
+            &mut ctx, &a).await.unwrap();
+        {
+            let page = ctx.get_session_page_mut(&a).unwrap();
+            assert_eq!(page.evaluate_script("typeof latest").unwrap(), json!("undefined"));
+            page.evaluate_script("(() => { const f=document.createElement('iframe'); f.srcdoc='<p>child</p>'; document.body.appendChild(f); })()").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while page.frames.is_empty() { page.run_autonomous_event_loop_turn().await.unwrap(); }
+            }).await.expect("child document must load");
+            assert_eq!(page.evaluate_in_frame(0, "[owner, count, latest]").unwrap(), json!(["first", 1, true]));
+        }
+        assert_eq!(handle("removeScriptToEvaluateOnNewDocument", &registration, &mut ctx, &b)
+            .await.unwrap_err(), "Script not found");
+        assert_eq!(ctx.preload_scripts.len(), 3);
+        ctx.remove_page(&first);
+        assert_eq!(ctx.preload_scripts.len(), 1);
+        assert_eq!(ctx.preload_script_pages.len(), 1);
+        assert!(ctx.preload_script_pages.values().all(|owner| owner == &second));
+        handle("navigate", &json!({"url":"data:text/html,<title>next</title>"}), &mut ctx, &b).await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&b).unwrap().evaluate_script("[owner, count]").unwrap(),
+            json!(["second", 1]));
+        ctx.remove_page(&second);
+        assert!(ctx.preload_scripts.is_empty());
+        assert!(ctx.preload_script_pages.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
